@@ -183,7 +183,7 @@
 <text x="380" y="327" text-anchor="middle" font-size="11" fill="#334155"><tspan font-weight="700">每区独立全链路部署</tspan> — Consumer → Redis → Snapshot API → CDN → SDK</text>
 </svg><div class="fig-cap">图 2 — 写只在主区，Kafka 扇出，每区独立部署全链路</div></div>
 
-<p><b>关键：</b>写只在 us-east；每区有独立 Redis+Snapshot+CDN；跨区 Kafka 延迟 1~5s，开关场景可接受。</p>
+<p><b>关键：</b>写只在 us-east（PG 主库）；每区有独立 Redis + Snapshot API + CDN；Management API 每次写操作后同步发 Kafka 事件（自带完整 flag 定义 + 受影响的 app 列表），Consumer 收到后直接 merge 进 Redis，不需要查 PG（Kafka 自带数据，不依赖跨区 PG 副本）；跨区 Kafka 延迟 1~5s，开关场景可接受。</p>
 <p><b>注：</b>eu-west/ap-southeast 的运营改 flag 时，Management API 在本区接收请求后<b>转发写</b>到 us-east 主库（多 200ms RTT，可接受），读仍走本区。完全 multi-master 配置系统代价远高于收益。</p>
 
 <!-- ======== 3 ======== -->
@@ -391,15 +391,15 @@ func HandleSnapshot(w, r):
     w.Write(JSON{version: redis.Get(key_ver), flags: flags, etag: redis.Get(key_ver)})</code></pre>
 
 <p><b>关键：version 和 data 必须原子写。</b>如果分两次 SET，读端可能看到新 version + 旧 data（或反过来），SDK 缓存状态撕裂。用 Lua 在 Redis 端一次写两个 key：</p>
-<pre><code>-- Kafka consumer 每次重建快照后调一次（每个 (env, app) 一次）
--- KEYS[1]=version key, KEYS[2]=data key, ARGV[1]=new_version, ARGV[2]=json
+<pre><code>-- Consumer 将单个 flag merge 进 per-app snapshot（原子 INCR + SET）
+-- KEYS[1]=version key, KEYS[2]=data key, ARGV[1]=json
 redis.eval([[
-    redis.call('SET', KEYS[1], ARGV[1])
-    redis.call('SET', KEYS[2], ARGV[2])
-    return 1
-]], {key_ver, key_data}, {new_version, json_data})</code></pre>
+    local v = redis.call('INCR', KEYS[1])
+    redis.call('SET', KEYS[2], ARGV[1])
+    return v
+]], {key_ver, key_data}, {json_data})</code></pre>
 
-<p>Redis 里的 snapshot 数据是 Kafka consumer 写进去的——每次有 flag 变更或 app 可见范围变更，consumer 从 PostgreSQL 读出该 (env, app) 下所有可见 active flag，拼成快照 JSON，<b>通过上面 Lua 原子地</b>写入 Redis 的两个 key。consumer 要写 4 × N 个 (env, app) 组合，每次 flag 变更是 N 次写入而不是 1 次。</p>
+<p><b>方案 B — Kafka 自带完整数据。</b>Management API 写 flag 后同步发 Kafka 事件：<code>{ flagKey, env, op, definition, scopedAppIds }</code>。每个 Region 的 Consumer 收到事件后，直接把 flag merge 进每个关联 app 的 Redis snapshot——<b>不需要查 PostgreSQL</b>。Lua 脚本原子地递增版本号（INCR）并写入新快照（SET）。60s @Scheduled 全量 sweep 作为兜底，覆盖 Kafka 丢失的极端情况。每次 flag 变更是 N 次 Redis 写入（每个关联 app 一次），而不是 1 次——这是 per-app 隔离的写放大代价，换来了 CDN 按 app 缓存、SDK 小带宽拉取、跨团队 flag key namespace 隔离的能力。</p>
 
 <p><b>一个具体例子（checkout-service 这个 app 看到的）：</b></p>
 <pre><code>// GET /api/v1/snapshot   Authorization: Bearer sk_live_xxx   X-Env: production   →   200 OK

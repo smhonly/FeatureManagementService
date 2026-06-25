@@ -1,7 +1,9 @@
 package com.example.managementapi.service;
 
 import com.example.managementapi.domain.Flag;
+import com.example.managementapi.event.FlagChangePublisher;
 import com.example.managementapi.repository.AuditRepository;
+import com.example.managementapi.repository.FlagAppScopeRepository;
 import com.example.managementapi.repository.FlagRepository;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -33,11 +35,17 @@ public class FlagService {
 
     private final FlagRepository flagRepo;
     private final AuditRepository auditRepo;
+    private final FlagAppScopeRepository scopeRepo;
+    private final FlagChangePublisher publisher;
     private final ObjectMapper json;
 
-    public FlagService(FlagRepository flagRepo, AuditRepository auditRepo, ObjectMapper json) {
+    public FlagService(FlagRepository flagRepo, AuditRepository auditRepo,
+                       FlagAppScopeRepository scopeRepo, FlagChangePublisher publisher,
+                       ObjectMapper json) {
         this.flagRepo = flagRepo;
         this.auditRepo = auditRepo;
+        this.scopeRepo = scopeRepo;
+        this.publisher = publisher;
         this.json = json;
     }
 
@@ -47,7 +55,7 @@ public class FlagService {
         validateDefinition(definition);
         Flag f = flagRepo.insert(key, env, definition, critical, owner, release);
         auditRepo.record(actor, "created", key + "@" + env, definition, null);
-
+        publish(key, env, definition, "created");
         return f;
     }
 
@@ -77,7 +85,7 @@ public class FlagService {
         Flag updated = flagRepo.find(key, env).orElseThrow();
         flagRepo.insertHistory(key, env, updated.version(), definition, actor);
         auditRepo.record(actor, "updated", key + "@" + env, definition, null);
-
+        publish(key, env, definition, "updated");
         return updated;
     }
 
@@ -97,6 +105,7 @@ public class FlagService {
         flagRepo.insertHistory(key, env, current.version() + 1, current.definition(), actor);
         auditRepo.record(actor, "archived", key + "@" + env,
                 json.createObjectNode().put("previous_version", current.version()), null);
+        publish(key, env, null, "archived");
     }
 
     /**
@@ -171,5 +180,11 @@ public class FlagService {
                         "pct_rollout requires integer pct in [0,100]");
             }
         }
+    }
+
+    /** Publish a flag change event to Kafka for cross-region consumers. */
+    private void publish(String key, String env, JsonNode definition, String op) {
+        List<Integer> appIds = scopeRepo.listAppIdsForFlag(key, env);
+        publisher.publishFlagChange(key, env, definition, op, appIds);
     }
 }

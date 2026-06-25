@@ -1,5 +1,7 @@
 package com.example.managementapi.service;
 
+import com.example.managementapi.domain.Flag;
+import com.example.managementapi.event.FlagChangePublisher;
 import com.example.managementapi.repository.ApplicationRepository;
 import com.example.managementapi.repository.AuditRepository;
 import com.example.managementapi.repository.FlagAppScopeRepository;
@@ -26,23 +28,25 @@ public class FlagAppScopeService {
     private final FlagRepository flagRepo;
     private final ApplicationRepository appRepo;
     private final AuditRepository auditRepo;
+    private final FlagChangePublisher publisher;
 
     public FlagAppScopeService(FlagAppScopeRepository scopeRepo,
                                FlagRepository flagRepo,
                                ApplicationRepository appRepo,
-                               AuditRepository auditRepo) {
+                               AuditRepository auditRepo,
+                               FlagChangePublisher publisher) {
         this.scopeRepo = scopeRepo;
         this.flagRepo = flagRepo;
         this.appRepo = appRepo;
         this.auditRepo = auditRepo;
+        this.publisher = publisher;
     }
 
     @Transactional(rollbackFor = Exception.class)
     public void grant(String actor, String flagKey, String env, int appId) {
-        if (flagRepo.find(flagKey, env).isEmpty()) {
-            throw new ResponseStatusException(HttpStatus.NOT_FOUND,
-                    "flag not found: " + flagKey + "@" + env);
-        }
+        Flag flag = flagRepo.find(flagKey, env)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND,
+                        "flag not found: " + flagKey + "@" + env));
         if (appRepo.findById(appId).isEmpty()) {
             throw new ResponseStatusException(HttpStatus.NOT_FOUND,
                     "app not found: id=" + appId);
@@ -53,6 +57,8 @@ public class FlagAppScopeService {
         auditRepo.record(actor, "scope_granted",
                 flagKey + "@" + env + "->app:" + appId,
                 null, null);
+        publisher.publishScopeChange(flagKey, env, appId, "scope_granted",
+                flag.definition());
     }
 
     @Transactional(rollbackFor = Exception.class)
@@ -60,10 +66,17 @@ public class FlagAppScopeService {
         // DELETE is idempotent: revoking something that was never granted
         // affects 0 rows. We still record the attempt — failed revokes
         // can indicate operator typos or hostile probing.
+        Flag flag = flagRepo.find(flagKey, env).orElse(null);
         scopeRepo.revoke(flagKey, env, appId);
         auditRepo.record(actor, "scope_revoked",
                 flagKey + "@" + env + "->app:" + appId,
                 null, null);
+        if (flag != null) {
+            // For revoke, the flag should be REMOVED from the app's snapshot.
+            // Pass null definition so mergeFlag removes it.
+            publisher.publishScopeChange(flagKey, env, appId, "scope_revoked",
+                    null);
+        }
     }
 
     public List<Integer> listAppIdsForFlag(String flagKey, String env) {

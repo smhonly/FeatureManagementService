@@ -15,6 +15,7 @@
         <module>feature-flag-sdk</module>
         <module>management-api</module>
         <module>snapshot-api</module>
+        <module>e2e-tests</module>
     </modules>
 
     <properties>
@@ -38,10 +39,20 @@
                 <scope>import</scope>
             </dependency>
 
-            <!-- Internal module — children reference without version -->
+            <!-- Internal modules — children reference without version -->
             <dependency>
                 <groupId>com.example</groupId>
                 <artifactId>feature-flag-sdk</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.example</groupId>
+                <artifactId>management-api</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.example</groupId>
+                <artifactId>snapshot-api</artifactId>
                 <version>${project.version}</version>
             </dependency>
 

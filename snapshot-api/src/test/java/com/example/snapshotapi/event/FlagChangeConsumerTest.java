@@ -1,8 +1,8 @@
 package com.example.snapshotapi.event;
 
 import com.example.snapshotapi.service.SnapshotBuilderService;
+import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import org.junit.jupiter.api.Test;
-import org.mockito.ArgumentCaptor;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
@@ -12,22 +12,23 @@ import org.springframework.kafka.test.context.EmbeddedKafka;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.TestPropertySource;
 
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 import static org.awaitility.Awaitility.await;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 
 /**
- * Integration test for {@link FlagChangeConsumer} using a real embedded Kafka
- * broker. Verifies that a {@link FlagChangeEvent} produced to the CDC topic
- * triggers a snapshot rebuild for the right (env, app) pair.
+ * Integration test for {@link FlagChangeConsumer} with embedded Kafka.
  *
- * The @Scheduled sweep in SnapshotBuilderService is disabled here so the
- * test only sees rebuilds triggered by the Kafka consumer.
+ * <p>Design B — every event carries definition + scopedAppIds.
+ * The Consumer calls {@code mergeFlagForApp} for each scoped app.</p>
  */
 @SpringBootTest
 @EmbeddedKafka(
@@ -54,11 +55,6 @@ class FlagChangeConsumerTest {
     @MockBean
     SnapshotBuilderService builder;
 
-    /**
-     * ApplicationRegistry and SnapshotStore both depend on StringRedisTemplate;
-     * we don't need a real Redis here because rebuildForApp is mocked, but
-     * Spring still wires the bean graph.
-     */
     @MockBean
     StringRedisTemplate redis;
 
@@ -66,42 +62,46 @@ class FlagChangeConsumerTest {
     KafkaTemplate<String, Object> kafkaTemplate;
 
     @Test
-    void eventWithAppIdTriggersRebuildForThatApp() throws Exception {
-        FlagChangeEvent event = new FlagChangeEvent("new_checkout", "production", 42, "updated");
+    void eventWithDefinitionAndScopedAppsTriggersMergeForEachApp() throws Exception {
+        var event = new FlagChangeEvent("checkout_v2", "production", "updated",
+                JsonNodeFactory.instance.objectNode().put("type", "boolean"),
+                List.of(42, 7));
+
+        kafkaTemplate.send("ff.flag.changes", event).get(5, TimeUnit.SECONDS);
+
+        await().atMost(5, TimeUnit.SECONDS).untilAsserted(() -> {
+            verify(builder, atLeastOnce()).mergeFlagForApp(
+                    eq("production"), eq(42), eq("checkout_v2"), any(), eq("updated"));
+            verify(builder, atLeastOnce()).mergeFlagForApp(
+                    eq("production"), eq(7), eq("checkout_v2"), any(), eq("updated"));
+        });
+    }
+
+    @Test
+    void eventWithArchivedOpCallsMergeFlagForApp() throws Exception {
+        // Archive: definition=null (Kafka will deserialise as NullNode, but that's
+        // normalised inside mergeFlagForApp — the important thing is it's called)
+        var event = new FlagChangeEvent("old_flag", "production", "archived",
+                null, List.of(99));
+
         kafkaTemplate.send("ff.flag.changes", event).get(5, TimeUnit.SECONDS);
 
         await().atMost(5, TimeUnit.SECONDS).untilAsserted(() ->
-                verify(builder, atLeastOnce()).rebuildForApp("production", 42)
+                verify(builder, atLeastOnce()).mergeFlagForApp(
+                        eq("production"), eq(99), eq("old_flag"), any(), eq("archived"))
         );
     }
 
     @Test
-    void eventWithoutAppIdQueriesScopesAndRebuildsEach() throws Exception {
-        // appId == null path: the consumer looks up flag_app_scopes and rebuilds
-        // each app. With JdbcTemplate not mocked at this layer, the query goes
-        // to H2 — for a flag with no scopes, the result is "no rebuild calls",
-        // which is the correct behavior. We assert that no exception is raised
-        // and the consumer doesn't crash on a scoped event.
-        FlagChangeEvent event = new FlagChangeEvent("unknown_flag", "production", null, "updated");
-        kafkaTemplate.send("ff.flag.changes", event).get(5, TimeUnit.SECONDS);
+    void malformedEventWithNullFlagKeyIsIgnored() throws Exception {
+        var event = new FlagChangeEvent(null, "production", "updated",
+                JsonNodeFactory.instance.objectNode().put("type", "boolean"),
+                List.of(1));
 
-        // Give the consumer time to process; with no scopes in the DB, the
-        // for-loop has nothing to iterate.
+        kafkaTemplate.send("ff.flag.changes", event).get(5, TimeUnit.SECONDS);
         Thread.sleep(1500);
 
-        ArgumentCaptor<String> envCap = ArgumentCaptor.forClass(String.class);
-        ArgumentCaptor<Integer> appCap = ArgumentCaptor.forClass(Integer.class);
-        verify(builder, never()).rebuildForApp(envCap.capture(), appCap.capture());
-    }
-
-    @Test
-    void malformedEventIsIgnored() throws Exception {
-        // flagKey == null → consumer logs and returns
-        FlagChangeEvent event = new FlagChangeEvent(null, "production", 1, "updated");
-        kafkaTemplate.send("ff.flag.changes", event).get(5, TimeUnit.SECONDS);
-
-        Thread.sleep(1500);
-
-        verify(builder, never()).rebuildForApp(anyString(), anyInt());
+        verify(builder, never()).mergeFlagForApp(anyString(), anyInt(),
+                anyString(), any(), anyString());
     }
 }

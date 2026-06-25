@@ -1,24 +1,38 @@
 package com.example.snapshotapi.event;
 
+import com.fasterxml.jackson.databind.JsonNode;
+
+import java.util.List;
+
 /**
  * Event consumed off Kafka (design §2: CDC → Kafka → Consumer → Redis).
  *
- * In production the producer is a Debezium-style CDC stream reading the
- * PostgreSQL WAL — the consumer doesn't care about the source, it just
- * reacts to the JSON payload on the topic.
+ * <p>Design B — Kafka carries the full flag definition so the Consumer
+ * can merge without touching PostgreSQL:</p>
  *
- * appId semantics:
- *   null  → the change is to a flag itself; rebuild every app that has
- *           this flag in its scope (query flag_app_scopes)
- *   set   → the change is to a specific app's visibility, or the app
- *           was just registered/revoked; rebuild only that app
+ * <pre>
+ *   Management API → PG → CDC → Kafka (full payload) → Consumer → Redis
+ * </pre>
  *
- * op is informational; the consumer treats all events the same way
- * (rebuild) and lets the source filter if it cares about action types.
+ * <p>Payload semantics:</p>
+ * <dl>
+ *   <dt>{@code definition} present</dt>
+ *   <dd>The event carries the full flag definition.  Consumer can merge
+ *       directly into the snapshot without querying PG.  This is the
+ *       normal path for flag create / update / archive.</dd>
+ *   <dt>{@code definition} absent (null)</dt>
+ *   <dd>The event is a scope-only change or a legacy notification.
+ *       Consumer falls back to the {@code rebuildForApp} sweep path
+ *       which queries PG.</dd>
+ * </dl>
+ *
+ * <p>{@code scopedAppIds}, when set, tells the Consumer exactly which
+ * apps need a snapshot rebuild — no need to query {@code flag_app_scopes}.</p>
  */
 public record FlagChangeEvent(
         String flagKey,
         String env,
-        Integer appId,
-        String op
+        String op,
+        JsonNode definition,
+        List<Integer> scopedAppIds
 ) {}

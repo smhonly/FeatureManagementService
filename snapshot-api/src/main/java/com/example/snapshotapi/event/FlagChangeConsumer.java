@@ -3,21 +3,25 @@ package com.example.snapshotapi.event;
 import com.example.snapshotapi.service.SnapshotBuilderService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Component;
 
-import java.util.List;
-
 /**
- * The "Consumer" in the design's data path:
+ * The "Consumer" in design B's data path:
  *
- *   Management API → PG → CDC → Kafka → [this] → Redis → Pub/Sub → SDK
+ * <pre>
+ *   Management API → PG + Kafka (full definition + scopedAppIds)
+ *                          │
+ *                          ▼
+ *                    [this Consumer] ──mergeFlagForApp──► Redis → Pub/Sub → SDK
+ * </pre>
  *
- * Receives flag/scope change events from Kafka and triggers a snapshot
- * rebuild for the affected (env, app) pair(s). This is the sub-second
- * path — the @Scheduled sweep in SnapshotBuilderService is the fallback
- * for when Pub/Sub drops a notify or Kafka is unavailable.
+ * <p>The event is self-contained: it carries the complete flag definition
+ * and the list of scoped app IDs.  The Consumer never queries PostgreSQL —
+ * each event is merged directly into the per-app Redis snapshot.</p>
+ *
+ * <p>The @Scheduled sweep in SnapshotBuilderService is the fallback for
+ * when Kafka is unavailable.</p>
  */
 @Component
 public class FlagChangeConsumer {
@@ -25,11 +29,9 @@ public class FlagChangeConsumer {
     private static final Logger log = LoggerFactory.getLogger(FlagChangeConsumer.class);
 
     private final SnapshotBuilderService builder;
-    private final JdbcTemplate jdbc;
 
-    public FlagChangeConsumer(SnapshotBuilderService builder, JdbcTemplate jdbc) {
+    public FlagChangeConsumer(SnapshotBuilderService builder) {
         this.builder = builder;
-        this.jdbc = jdbc;
     }
 
     @KafkaListener(
@@ -41,23 +43,20 @@ public class FlagChangeConsumer {
             log.warn("ignoring malformed event: {}", event);
             return;
         }
+        if (event.scopedAppIds() == null || event.scopedAppIds().isEmpty()) {
+            log.warn("ignoring event without scopedAppIds: {}", event);
+            return;
+        }
         try {
-            if (event.appId() != null) {
-                builder.rebuildForApp(event.env(), event.appId());
-            } else {
-                List<Integer> appIds = jdbc.queryForList(
-                        "SELECT DISTINCT app_id FROM flag_app_scopes " +
-                                "WHERE flag_key = ? AND env = ?",
-                        Integer.class, event.flagKey(), event.env());
-                for (int appId : appIds) {
-                    builder.rebuildForApp(event.env(), appId);
-                }
+            for (int appId : event.scopedAppIds()) {
+                builder.mergeFlagForApp(event.env(), appId,
+                        event.flagKey(), event.definition(), event.op());
             }
         } catch (Exception e) {
             // Don't let a transient failure poison the consumer group.
             // The next event will retry, and the 60s scheduled sweep is
             // the eventual-consistency floor.
-            log.error("rebuild failed for event={}: {}", event, e.getMessage(), e);
+            log.error("merge failed for event={}: {}", event, e.getMessage(), e);
         }
     }
 }

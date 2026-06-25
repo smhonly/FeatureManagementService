@@ -17,24 +17,28 @@
 feature-flag-sdk/     Java 21 SDK（纯 stdlib + Jackson + Jedis optional）
 management-api/       Spring Boot 3.3 控制面（CRUD、auth、/explain）
 snapshot-api/         Spring Boot 3.3 数据面（GET /snapshot + ETag + Pub/Sub）
+e2e-tests/            端到端测试（起两个服务 + 内嵌 Redis + 共享 H2）
 docs/                 design.md / design.html 架构设计文档
 ```
 
-三个 Maven 模块，无 parent POM。
+四个 Maven 模块，统一父 POM。
 
 ---
 
 ## 快速开始
 
-**前置条件：** JDK 21、Maven 3.8+、Redis 7+
+**前置条件：** JDK 21、Maven 3.8+
+
+运行服务需要 Redis 7+（见步骤 2）。**跑测试不需要** —— e2e 测试自带内嵌 Redis。
 
 ### 1. 构建全部模块
 
 ```bash
-mvn install -f feature-flag-sdk/pom.xml -DskipTests   # SDK 必须先装到本地
-mvn test -f feature-flag-sdk/pom.xml                   # 34 tests
-mvn test -f management-api/pom.xml                     #  8 tests
-mvn test -f snapshot-api/pom.xml                       #  6 tests
+# 编译安装 SDK（其他模块依赖它）
+mvn install -f feature-flag-sdk/pom.xml -DskipTests
+
+# 运行全部测试（含 e2e）
+mvn test
 ```
 
 ### 2. 启动 Redis
@@ -53,17 +57,6 @@ mvn spring-boot:run -f management-api/pom.xml
 
 ```bash
 mvn spring-boot:run -f snapshot-api/pom.xml
-```
-
-### 4. 运行 SDK Demo
-
-```bash
-mvn package -f feature-flag-sdk/pom.xml -DskipTests
-
-java -DbaseUrl=http://localhost:8090 \
-     -DapiKey=sk_live_demo_key \
-     -Denv=production \
-     -jar feature-flag-sdk/target/feature-flag-sdk-0.1.0.jar
 ```
 
 ### 5. 运行 SDK Demo
@@ -148,11 +141,37 @@ GET    /api/v1/explain?flag=&user=&at=      确定性重放
 
 ## 运行测试
 
+### 单元 / 集成测试
+
 ```bash
-mvn test -f feature-flag-sdk/pom.xml    # 34 tests
+mvn test -f feature-flag-sdk/pom.xml    # 41 tests
 mvn test -f management-api/pom.xml      #  8 tests (SpringBootTest + H2)
-mvn test -f snapshot-api/pom.xml        #  6 tests (SpringBootTest + H2 + Mock Redis)
+mvn test -f snapshot-api/pom.xml        #  9 tests (SpringBootTest + H2 + Mock Redis)
 ```
+
+### E2E 测试
+
+端到端测试在一个 JVM 里启动 management-api 和 snapshot-api（随机端口）、内嵌 Redis（自动找空闲端口）、共享 H2 内存数据库，SDK 走 loopback HTTP 调用 snapshot-api。
+
+**不需要 Docker、不需要安装 Redis。** 内嵌 Redis 由 `com.github.codemonstur:embedded-redis` 自动管理。
+
+```bash
+# 首次 / 代码有改动时 —— 构建所有依赖模块
+mvn test -pl e2e-tests -am -Dtest='com.example.e2e.**' -Dsurefire.failIfNoSpecifiedTests=false
+
+# 后续 —— 仅运行 e2e 测试（依赖已装到本地 Maven 仓库）
+mvn test -pl e2e-tests -Dtest='com.example.e2e.**' -Dsurefire.failIfNoSpecifiedTests=false
+```
+
+e2e 覆盖场景：
+
+| 测试类 | 覆盖 |
+|--------|------|
+| `HappyPathTest` | boolean flag 创建→快照重建→SDK 拉取→isEnabled()；scope 隔离；targeting 规则；百分比灰度分布；本地评测性能 |
+| `FlagLifecycleTest` | 更新传播（定义变更后 SDK 看到新定义）；软删除（archive 后从快照消失）；版本号冲突（412）；乐观锁版本递增 |
+| `ExplainReplayTest` | /explain 确定性重放（更新后查询当前版本）；历史时间点 404；不存在的 flag 404 |
+| `AuthFlowTest` | 合法 API key；不合法 API key → 401；缺失 Auth header → 401；有快照时 → 200 |
+| `EtagCachingTest` | 首次请求 → 200 + ETag；相同 ETag → 304；快照更新后旧 ETag → 200 + 新版本号 |
 
 ---
 

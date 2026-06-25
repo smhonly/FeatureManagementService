@@ -64,7 +64,7 @@ Write path — only deployed in us-east primary
 
 *Figure 2 — Writes only happen in primary, Kafka fans out, each region runs the full stack.*
 
-**Key points:** writes only happen in us-east; each region has independent Redis + Snapshot + CDN; cross-region Kafka latency is 1–5 s, acceptable for flag use cases.
+**Key points:** writes only happen in us-east (PG primary); each region has an independent Redis + Snapshot API + CDN; the Management API publishes self-contained Kafka events (flagKey + full definition + scoped app IDs) after each write, so the Consumer in each region can merge directly into Redis without querying PostgreSQL — Kafka carries the data, not just a notification; cross-region Kafka latency is 1–5 s, acceptable for flag use cases.
 
 **Note:** when an operator in eu-west/ap-southeast changes a flag, the Management API receives the request in-region then **forwards the write** to the us-east primary (extra ~200 ms RTT, acceptable). Reads still go to the local region. Full multi-master for a config system costs far more than it returns.
 
@@ -240,16 +240,16 @@ func HandleSnapshot(w, r):
 **Critical: version and data must be written atomically.** If SET happens in two calls, a reader can see new version + old data (or vice versa), tearing the SDK cache. Use a Lua script to write both keys atomically on the Redis side:
 
 ```lua
--- Kafka consumer calls this each time it rebuilds the snapshot (once per (env, app))
--- KEYS[1]=version key, KEYS[2]=data key, ARGV[1]=new_version, ARGV[2]=json
+-- Consumer merges a single flag into the per-app snapshot (atomic INCR + SET)
+-- KEYS[1]=version key, KEYS[2]=data key, ARGV[1]=json
 redis.eval([[
-    redis.call('SET', KEYS[1], ARGV[1])
-    redis.call('SET', KEYS[2], ARGV[2])
-    return 1
-]], {key_ver, key_data}, {new_version, json_data})
+    local v = redis.call('INCR', KEYS[1])
+    redis.call('SET', KEYS[2], ARGV[1])
+    return v
+]], {key_ver, key_data}, {json_data})
 ```
 
-The Redis snapshot is written by the Kafka consumer — every time a flag changes or app visibility changes, the consumer reads all visible active flags for that (env, app) from PostgreSQL, builds the snapshot JSON, and **atomically** writes both Redis keys via the Lua script above. The consumer must write 4 × N (env, app) combinations; one flag change triggers N writes instead of one.
+**Design B — Kafka carries the full payload.** After a flag mutation, the Management API publishes a self-contained event to Kafka: `{ flagKey, env, op, definition, scopedAppIds }`. The Consumer in each region receives this event and merges the flag directly into each scoped app's Redis snapshot — no PostgreSQL query needed. The Lua script above atomically bumps the version (INCR) and persists the new snapshot (SET). The 60s @Scheduled sweep still calls the full `rebuildForApp` path as a fallback for missed events. One flag change triggers N Redis writes (one per scoped app) — the write-amplification cost of per-app isolation, accepted because per-app snapshots are what make CDN caching, bandwidth-constrained SDK pulls, and cross-team flag-key namespace isolation possible.
 
 **Concrete example (what `checkout-service` sees):**
 

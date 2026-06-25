@@ -70,7 +70,7 @@ CREATE TABLE audit_log (
     detail      VARCHAR(2000),
     ip_address  VARCHAR(45),
     created_at  TIMESTAMP NOT NULL DEFAULT now(),
-    CHECK (action IN ('created','updated','rolled_out','targeted','archived','login'))
+    CHECK (action IN ('created','updated','rolled_out','targeted','archived','login','scope_granted','scope_revoked'))
 );
 CREATE INDEX idx_audit_actor_time ON audit_log(actor, created_at DESC);
 CREATE INDEX idx_audit_target     ON audit_log(target, created_at DESC);

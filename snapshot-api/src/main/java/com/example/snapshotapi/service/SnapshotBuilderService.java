@@ -47,6 +47,20 @@ public class SnapshotBuilderService {
 
     /**
      * Rebuild snapshot for a single (env, appId).
+     *
+     * <p>Queries {@code flags} and {@code flag_app_scopes} from the local
+     * region's PostgreSQL.  This means the method assumes the PG data has
+     * already been replicated from the primary region (us-east) — either
+     * via read replicas or logical replication.  The CDC→Kafka→Consumer
+     * event that triggers this call typically arrives before the PG replica
+     * catches up (sub-second vs. replica lag), so the caller should be
+     * prepared for an empty or stale rebuild on a cold replica.</p>
+     *
+     * <p>For this reason the Kafka event carries an optional {@code appId}.
+     * When {@code appId} is present the caller invokes this method directly;
+     * when absent the caller first queries {@code flag_app_scopes} on the
+     * local PG and fans out.  The {@code appId}-present path avoids a
+     * replica-lag race on the scopes query.</p>
      */
     public void rebuildForApp(String env, int appId) {
         List<FlagRow> rows = jdbc.query(
@@ -66,7 +80,6 @@ public class SnapshotBuilderService {
         );
 
         ArrayNode flagsArray = json.createArrayNode();
-        int maxVersion = 0;
         for (FlagRow row : rows) {
             ObjectNode entry = json.createObjectNode();
             entry.put("key", row.key());
@@ -76,14 +89,14 @@ public class SnapshotBuilderService {
                 entry.putObject("definition").put("type", "boolean");
             }
             flagsArray.add(entry);
-            if (row.version() > maxVersion) maxVersion = row.version();
         }
 
         ObjectNode body = json.createObjectNode();
-        body.put("version", "v" + maxVersion);
         body.set("flags", flagsArray);
 
-        snapshotStore.putAtomic(env, appId, maxVersion, body);
+        // putAtomic uses Redis INCR — monotonic version regardless of flag versions
+        int snapshotVersion = snapshotStore.putAtomic(env, appId, body);
+        body.put("version", "v" + snapshotVersion);
 
         // Notify SDKs via Pub/Sub (push channel — design §3)
         if (publisher != null) {
@@ -122,6 +135,28 @@ public class SnapshotBuilderService {
                 log.error("rebuild failed env={} app={}: {}", env, appId, e.getMessage(), e);
             }
         }
+    }
+
+    /**
+     * Merge a single flag into a per-app snapshot (design B — Kafka carries
+     * the full definition, no PG query needed).
+     *
+     * @param op "created" / "updated" → upsert;  "archived" → remove
+     */
+    public int mergeFlagForApp(String env, int appId, String flagKey,
+                               com.fasterxml.jackson.databind.JsonNode definition, String op) {
+        // Kafka deserialises JSON null as Jackson NullNode — normalise to Java null
+        if (definition != null && definition.isNull()) {
+            definition = null;
+        }
+        boolean isArchive = "archived".equals(op);
+        int newVersion = snapshotStore.mergeFlag(env, appId, flagKey,
+                isArchive ? null : definition);
+
+        if (publisher != null) {
+            publisher.notifySnapshotUpdated(env, appId);
+        }
+        return newVersion;
     }
 
     private record FlagRow(String key, String definitionJson, int version) {}
