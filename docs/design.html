@@ -1,0 +1,722 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Feature Management Service — 架构设计</title>
+<style>
+  :root{--c0:#0f172a;--c1:#475569;--c2:#94a3b8;--c3:#cbd5e1;--c4:#e2e8f0;--c5:#f1f5f9;--c6:#f8fafc;
+    --blue:#2563eb;--bl2:#dbeafe;--bl3:#eff6ff;--green:#16a34a;--gn2:#dcfce7;--gn3:#f0fdf4;
+    --red:#dc2626;--rd2:#fee2e2;--rd3:#fef2f2;--purple:#7c3aed;--pl2:#ede9fe;--pl3:#f5f3ff;
+    --amber:#d97706;--am2:#fef3c7;--am3:#fffbeb;}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font:16px/1.8 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;color:var(--c0);background:#fff;max-width:880px;margin:0 auto;padding:40px 24px}
+  h1{font-size:28px;border-bottom:2px solid var(--c4);padding-bottom:12px;margin-bottom:6px}
+  h1 .sub{font-size:15px;color:var(--c1);font-weight:400;margin-left:10px}
+  h2{font-size:21px;margin-top:48px;margin-bottom:8px;color:var(--c0)}
+  h3{font-size:17px;margin-top:28px;color:var(--c0)}
+  p{margin:10px 0}
+  nav.toc{font-size:13px;background:#f8fafc;border:1px solid var(--c4);border-radius:6px;padding:8px 12px;margin:8px 0 16px;color:var(--c2)}
+  nav.toc a{color:var(--c0);text-decoration:none;margin:0 2px}
+  nav.toc a:hover{text-decoration:underline}
+  code{font:13px/ui-monospace,SFMono-Regular,Consolas,monospace;background:var(--c5);padding:2px 6px;border-radius:4px}
+  pre{background:#1e293b;color:#e2e8f0;padding:16px 20px;border-radius:8px;overflow-x:auto;font-size:13px;line-height:1.65;margin:14px 0}
+  pre code{background:none;padding:0;color:inherit}
+  table{border-collapse:collapse;width:100%;margin:14px 0;font-size:14px}
+  caption{caption-side:top;text-align:left;font-weight:600;color:var(--c1);padding:6px 0;font-size:13px}
+  th,td{border:1px solid var(--c4);padding:10px 14px;text-align:left;vertical-align:top}
+  th{background:var(--c6);font-weight:600}
+  .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+  .b-info{background:var(--bl3);border-left:4px solid var(--blue);padding:14px 18px;margin:18px 0;border-radius:0 6px 6px 0;font-size:15px}
+  .b-warn{background:var(--am3);border-left:4px solid var(--amber);padding:14px 18px;margin:18px 0;border-radius:0 6px 6px 0;font-size:15px}
+  .b-key{background:var(--c6);border:1.5px solid var(--c4);padding:16px 20px;margin:18px 0;border-radius:8px;font-size:15px}
+  .fig{margin:20px 0;text-align:center;overflow-x:auto}
+  .fig svg{max-width:100%;height:auto;display:block;margin:0 auto}
+  .fig-cap{font-size:13px;color:var(--c1);margin-top:6px}
+  ol.s{padding-left:22px;line-height:2.2}
+  @media(max-width:700px){body{padding:16px;font-size:15px}}
+  @media(prefers-color-scheme:dark){
+    :root{--c0:#e2e8f0;--c1:#cbd5e1;--c2:#94a3b8;--c3:#64748b;--c4:#475569;--c5:#1e293b;--c6:#0f172a}
+    body{background:#0b1220}
+    pre{background:#020617}
+  }
+</style>
+</head>
+<body>
+<header>
+<h1>Feature Management Service <span class="sub">架构设计</span></h1>
+<p style="color:var(--c1)">100+ 应用 · 10,000+ 开关 · 每秒 10 万次查询（100K QPS）· 99% 请求在 10ms 内返回（P99 &lt;10ms）</p>
+</header>
+<main>
+
+<div class="b-info"><b>三个核心决策：</b><br>
+  <b>1.</b> 缓存<b>开关定义</b>（非评估结果），SDK 本地执行 → 调 isEnabled() 时无网络请求<br>
+  <b>2.</b> <b>稳定哈希分桶+salt</b>做百分比灰度 → 同用户永远同桶，跨开关无关联<br>
+  <b>3.</b> <b>确定性重放</b>替代评估日志 → 存版本历史(~20MB) vs 日志(864GB/天)
+</div>
+
+<!-- ======== 0 ======== -->
+<h2>0. 背景</h2>
+<p>电商有新功能想灰度——先给 5% 美国用户试用，没问题再放量。这就是功能开关：后台点一下，线上行为就变，不用部署。</p>
+<div class="b-key"><b>问题：</b>应用问"<code>new_checkout</code> 对用户 <code>U123</code> 是开是关？"→ <b>10ms</b> 内回答，每秒 <b>10 万次</b>。</div>
+
+<!-- ======== 1 ======== -->
+<h2>1. 核心思路：SDK 本地算</h2>
+<p>每次 <code>isEnabled()</code> 发 HTTP → 10万QPS全慢5ms，服务器挂了业务全停。配置系统不该有这么大影响范围。</p>
+<p><b>做法：</b>SDK 启动时下载完整快照到内存，之后评估全部本地完成。像手机离线地图。</p>
+
+<div class="fig"><svg viewBox="0 0 780 110" width="780" height="110" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="核心思路：Snapshot 服务下发配置，SDK 进程内本地评估，业务代码无网络调用"><defs>
+<marker id="a" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0L8,3L0,6Z" fill="#94a3b8"/></marker></defs>
+
+<rect x="0" y="8" width="230" height="94" rx="10" fill="#f8fafc" stroke="#2563eb" stroke-width="2"/>
+<text x="115" y="42" text-anchor="middle" font-size="14" font-weight="700" fill="#2563eb">Snapshot 服务</text>
+<text x="115" y="64" text-anchor="middle" font-size="12" fill="#475569">存所有开关的最新配置</text>
+<text x="115" y="84" text-anchor="middle" font-size="11" fill="#94a3b8">只有 GET /snapshot</text>
+
+<path d="M235 55 L275 55" fill="none" stroke="#16a34a" stroke-width="3" marker-end="url(#a)"/>
+<text x="255" y="44" text-anchor="middle" font-size="9" fill="#16a34a" font-weight="600">下载完整快照</text>
+<text x="255" y="80" text-anchor="middle" font-size="9" fill="#94a3b8">启动时全量 · 每30s ETag检查</text>
+
+<rect x="280" y="8" width="230" height="94" rx="10" fill="#f0fdf4" stroke="#16a34a" stroke-width="2"/>
+<text x="395" y="38" text-anchor="middle" font-size="14" font-weight="700" fill="#16a34a">SDK（应用进程内）</text>
+<text x="395" y="60" text-anchor="middle" font-size="12" fill="#475569">内存中保存完整快照</text>
+<text x="395" y="80" text-anchor="middle" font-size="11" fill="#94a3b8">isEnabled() → 纯内存读 · 微秒级</text>
+<text x="395" y="98" text-anchor="middle" font-size="10" fill="#94a3b8">不产生网络调用</text>
+
+<path d="M515 55 L555 55" fill="none" stroke="#7c3aed" stroke-width="2" marker-end="url(#a)"/>
+
+<rect x="560" y="18" width="220" height="74" rx="8" fill="#fff" stroke="#e2e8f0" stroke-width="1.5"/>
+<text x="670" y="48" text-anchor="middle" font-size="13" fill="#0f172a">你的业务代码</text>
+<text x="670" y="70" text-anchor="middle" font-size="12" font-family="monospace" fill="#7c3aed">client.isEnabled("flag", user)</text>
+</svg><div class="fig-cap">图 1 — Snapshot 只管下发配置，不参与每次评估</div></div>
+
+<div class="b-info"><b>设计灵魂：</b>高频评估走本地，低频的配置下载走服务端。控制面（管理开关的后台操作，低频）和数据面（SDK 评估开关，高频）完全分离。</div>
+
+<!-- ======== 2 ======== -->
+<h2>2. 跨 Region：一条变更怎么到全球 SDK</h2>
+
+<div class="fig"><svg viewBox="0 0 760 370" width="760" height="370" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="跨 Region 架构：写路径只在 us-east 主区，CDC→Kafka 扇出到 eu-west 和 ap-southeast，每区独立部署 Consumer→Redis→Snapshot API→CDN→SDK 全链路"><defs>
+<marker id="b" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0L8,3L0,6Z" fill="#94a3b8"/></marker></defs>
+
+<!-- Write Path Header -->
+<rect x="0" y="0" width="760" height="58" rx="10" fill="#f8fafc" stroke="#e2e8f0" stroke-width="1"/>
+<text x="16" y="20" font-size="10" font-weight="700" fill="#94a3b8">写路径 — 仅在主区 us-east 部署</text>
+
+<rect x="16" y="28" width="140" height="24" rx="6" fill="#fef2f2" stroke="#dc2626" stroke-width="1.5"/>
+<text x="86" y="44" text-anchor="middle" font-size="11" font-weight="600" fill="#dc2626">Management API</text>
+<line x1="161" y1="40" x2="186" y2="40" stroke="#94a3b8" stroke-width="1.2" marker-end="url(#b)"/>
+
+<rect x="191" y="28" width="120" height="24" rx="6" fill="#fff" stroke="#cbd5e1" stroke-width="1"/>
+<text x="251" y="44" text-anchor="middle" font-size="11" fill="#334155">PostgreSQL</text>
+<line x1="316" y1="40" x2="341" y2="40" stroke="#94a3b8" stroke-width="1.2" marker-end="url(#b)"/>
+
+<rect x="346" y="28" width="140" height="24" rx="6" fill="#f5f3ff" stroke="#7c3aed" stroke-width="1.5"/>
+<text x="416" y="44" text-anchor="middle" font-size="11" font-weight="600" fill="#7c3aed">CDC → Kafka</text>
+
+<text x="660" y="44" font-size="10" fill="#94a3b8">Kafka 异步投递到各区 →</text>
+
+<!-- Fan-out lines -->
+<line x1="488" y1="40" x2="540" y2="40" stroke="#475569" stroke-width="1.6" marker-end="url(#b)"/>
+<line x1="540" y1="40" x2="540" y2="74" stroke="#475569" stroke-width="1.6"/>
+<line x1="540" y1="74" x2="160" y2="74" stroke="#94a3b8" stroke-width="0.8"/>
+<line x1="540" y1="74" x2="380" y2="74" stroke="#94a3b8" stroke-width="0.8"/>
+<line x1="540" y1="74" x2="600" y2="74" stroke="#94a3b8" stroke-width="0.8"/>
+<line x1="160" y1="74" x2="160" y2="83" stroke="#94a3b8" stroke-width="1.2" marker-end="url(#b)"/>
+<line x1="380" y1="74" x2="380" y2="83" stroke="#94a3b8" stroke-width="1.2" marker-end="url(#b)"/>
+<line x1="600" y1="74" x2="600" y2="83" stroke="#94a3b8" stroke-width="1.2" marker-end="url(#b)"/>
+
+<!-- Three columns for three regions -->
+<!-- Divider lines -->
+<line x1="272" y1="87" x2="272" y2="275" stroke="#e2e8f0" stroke-width="1" stroke-dasharray="4,4"/>
+<line x1="500" y1="87" x2="500" y2="275" stroke="#e2e8f0" stroke-width="1" stroke-dasharray="4,4"/>
+
+<!-- Headers -->
+<rect x="60" y="87" width="200" height="26" rx="6" fill="#eff6ff" stroke="#2563eb" stroke-width="1.2"/>
+<text x="160" y="104" text-anchor="middle" font-size="11" font-weight="700" fill="#2563eb">us-east（主区 · ~0.5s）</text>
+
+<rect x="288" y="87" width="200" height="26" rx="6" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1"/>
+<text x="388" y="104" text-anchor="middle" font-size="11" font-weight="700" fill="#334155">eu-west（~2s）</text>
+
+<rect x="516" y="87" width="200" height="26" rx="6" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1"/>
+<text x="616" y="104" text-anchor="middle" font-size="11" font-weight="700" fill="#334155">ap-southeast（~3s）</text>
+
+<!-- A helper function in SVG is not possible, so draw each row explicitly -->
+<!-- Row 1: Consumer -->
+<rect x="60" y="117" width="200" height="24" rx="5" fill="#fff" stroke="#e2e8f0" stroke-width="1"/><text x="160" y="133" text-anchor="middle" font-size="10" fill="#334155">Kafka Consumer</text>
+<rect x="288" y="117" width="200" height="24" rx="5" fill="#fff" stroke="#e2e8f0" stroke-width="1"/><text x="388" y="133" text-anchor="middle" font-size="10" fill="#334155">Kafka Consumer</text>
+<rect x="516" y="117" width="200" height="24" rx="5" fill="#fff" stroke="#e2e8f0" stroke-width="1"/><text x="616" y="133" text-anchor="middle" font-size="10" fill="#334155">Kafka Consumer</text>
+<line x1="160" y1="141" x2="160" y2="149" stroke="#cbd5e1" stroke-width="1" marker-end="url(#b)"/>
+<line x1="388" y1="141" x2="388" y2="149" stroke="#cbd5e1" stroke-width="1" marker-end="url(#b)"/>
+<line x1="616" y1="141" x2="616" y2="149" stroke="#cbd5e1" stroke-width="1" marker-end="url(#b)"/>
+
+<!-- Row 2: Redis -->
+<rect x="60" y="153" width="200" height="24" rx="5" fill="#f0fdf4" stroke="#16a34a" stroke-width="1"/><text x="160" y="169" text-anchor="middle" font-size="10" fill="#16a34a">Redis 副本</text>
+<rect x="288" y="153" width="200" height="24" rx="5" fill="#f0fdf4" stroke="#16a34a" stroke-width="1"/><text x="388" y="169" text-anchor="middle" font-size="10" fill="#16a34a">Redis 副本</text>
+<rect x="516" y="153" width="200" height="24" rx="5" fill="#f0fdf4" stroke="#16a34a" stroke-width="1"/><text x="616" y="169" text-anchor="middle" font-size="10" fill="#16a34a">Redis 副本</text>
+<line x1="160" y1="177" x2="160" y2="185" stroke="#cbd5e1" stroke-width="1" marker-end="url(#b)"/>
+<line x1="388" y1="177" x2="388" y2="185" stroke="#cbd5e1" stroke-width="1" marker-end="url(#b)"/>
+<line x1="616" y1="177" x2="616" y2="185" stroke="#cbd5e1" stroke-width="1" marker-end="url(#b)"/>
+
+<!-- Row 3: Snapshot API -->
+<rect x="60" y="189" width="200" height="24" rx="5" fill="#fff" stroke="#e2e8f0" stroke-width="1"/><text x="160" y="205" text-anchor="middle" font-size="10" fill="#334155">Snapshot API</text>
+<rect x="288" y="189" width="200" height="24" rx="5" fill="#fff" stroke="#e2e8f0" stroke-width="1"/><text x="388" y="205" text-anchor="middle" font-size="10" fill="#334155">Snapshot API</text>
+<rect x="516" y="189" width="200" height="24" rx="5" fill="#fff" stroke="#e2e8f0" stroke-width="1"/><text x="616" y="205" text-anchor="middle" font-size="10" fill="#334155">Snapshot API</text>
+<line x1="160" y1="213" x2="160" y2="221" stroke="#cbd5e1" stroke-width="1" marker-end="url(#b)"/>
+<line x1="388" y1="213" x2="388" y2="221" stroke="#cbd5e1" stroke-width="1" marker-end="url(#b)"/>
+<line x1="616" y1="213" x2="616" y2="221" stroke="#cbd5e1" stroke-width="1" marker-end="url(#b)"/>
+
+<!-- Row 4: CDN -->
+<rect x="60" y="225" width="200" height="24" rx="5" fill="#fffbeb" stroke="#d97706" stroke-width="1"/><text x="160" y="241" text-anchor="middle" font-size="10" fill="#d97706">CDN 边缘缓存</text>
+<rect x="288" y="225" width="200" height="24" rx="5" fill="#fffbeb" stroke="#d97706" stroke-width="1"/><text x="388" y="241" text-anchor="middle" font-size="10" fill="#d97706">CDN 边缘缓存</text>
+<rect x="516" y="225" width="200" height="24" rx="5" fill="#fffbeb" stroke="#d97706" stroke-width="1"/><text x="616" y="241" text-anchor="middle" font-size="10" fill="#d97706">CDN 边缘缓存</text>
+<line x1="160" y1="249" x2="160" y2="257" stroke="#cbd5e1" stroke-width="1" marker-end="url(#b)"/>
+<line x1="388" y1="249" x2="388" y2="257" stroke="#cbd5e1" stroke-width="1" marker-end="url(#b)"/>
+<line x1="616" y1="249" x2="616" y2="257" stroke="#cbd5e1" stroke-width="1" marker-end="url(#b)"/>
+
+<!-- Row 5: SDK -->
+<rect x="60" y="261" width="200" height="24" rx="5" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/><text x="160" y="277" text-anchor="middle" font-size="10" fill="#16a34a" font-weight="600">SDK（本区应用）</text>
+<rect x="288" y="261" width="200" height="24" rx="5" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/><text x="388" y="277" text-anchor="middle" font-size="10" fill="#16a34a" font-weight="600">SDK（本区应用）</text>
+<rect x="516" y="261" width="200" height="24" rx="5" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/><text x="616" y="277" text-anchor="middle" font-size="10" fill="#16a34a" font-weight="600">SDK（本区应用）</text>
+
+<!-- Bottom bar -->
+<rect x="60" y="308" width="640" height="30" rx="8" fill="#f8fafc" stroke="#e2e8f0" stroke-width="1"/>
+<text x="380" y="327" text-anchor="middle" font-size="11" fill="#334155"><tspan font-weight="700">每区独立全链路部署</tspan> — Consumer → Redis → Snapshot API → CDN → SDK</text>
+</svg><div class="fig-cap">图 2 — 写只在主区，Kafka 扇出，每区独立部署全链路</div></div>
+
+<p><b>关键：</b>写只在 us-east；每区有独立 Redis+Snapshot+CDN；跨区 Kafka 延迟 1~5s，开关场景可接受。</p>
+<p><b>注：</b>eu-west/ap-southeast 的运营改 flag 时，Management API 在本区接收请求后<b>转发写</b>到 us-east 主库（多 200ms RTT，可接受），读仍走本区。完全 multi-master 配置系统代价远高于收益。</p>
+
+<!-- ======== 3 ======== -->
+<h2>3. 缓存更新：Push + Poll</h2>
+<p>SDK 怎么知道有新版本？两种唤醒方式，但醒来后做的事完全一样——去找 Snapshot API 拉完整快照。</p>
+
+<div class="fig"><svg viewBox="0 0 760 240" width="760" height="240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="缓存更新：Push（Redis Pub/Sub 敲门，秒级）和 Poll（SDK 定时器，30-60s）两种叫醒方式，但都触发同一份数据路径：SDK 拉完整快照"><defs>
+<marker id="cr" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0L8,3L0,6Z" fill="#dc2626"/></marker>
+<marker id="cb" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0L8,3L0,6Z" fill="#2563eb"/></marker>
+<marker id="cg" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0L8,3L0,6Z" fill="#16a34a"/></marker></defs>
+
+<!-- Top -->
+<rect x="235" y="4" width="290" height="44" rx="10" fill="#f0fdf4" stroke="#16a34a" stroke-width="2.5"/>
+<text x="380" y="24" text-anchor="middle" font-size="14" font-weight="700" fill="#16a34a">Snapshot API（经 CDN）</text>
+<text x="380" y="41" text-anchor="middle" font-size="9" fill="#64748b">所有开关配置的唯一数据源</text>
+
+<!-- Center: SDK -->
+<rect x="235" y="144" width="290" height="44" rx="10" fill="#f0fdf4" stroke="#16a34a" stroke-width="2.5"/>
+<text x="380" y="164" text-anchor="middle" font-size="14" font-weight="700" fill="#16a34a">SDK</text>
+<text x="380" y="181" text-anchor="middle" font-size="9" fill="#64748b">不管谁叫醒，动作一样：拉完整快照</text>
+
+<!-- Data path: SDK ↔ Snapshot -->
+<line x1="330" y1="144" x2="330" y2="53" stroke="#16a34a" stroke-width="2.2" marker-end="url(#cg)"/>
+<text x="314" y="102" font-size="9" fill="#16a34a" font-weight="600">SDK 请求</text>
+<line x1="430" y1="53" x2="430" y2="144" stroke="#16a34a" stroke-width="2.2" marker-end="url(#cg)"/>
+<text x="446" y="102" font-size="9" fill="#16a34a" font-weight="600">返回快照</text>
+
+<!-- Left: Push -->
+<rect x="10" y="65" width="220" height="64" rx="10" fill="#fef2f2" stroke="#dc2626" stroke-width="1.8"/>
+<text x="120" y="88" text-anchor="middle" font-size="13" font-weight="700" fill="#dc2626">通道一 Push</text>
+<text x="120" y="106" text-anchor="middle" font-size="10" fill="#64748b">触发者：Redis Pub/Sub</text>
+<text x="120" y="122" text-anchor="middle" font-size="9" fill="#dc2626">仅 critical 开关 · &lt;1s</text>
+<text x="120" y="138" text-anchor="middle" font-size="15" fill="#dc2626">🔔</text>
+<line x1="230" y1="97" x2="260" y2="159" stroke="#dc2626" stroke-width="1.8" marker-end="url(#cr)"/>
+<text x="237" y="132" font-size="8" fill="#dc2626">推</text>
+
+<!-- Right: Poll -->
+<rect x="530" y="65" width="220" height="64" rx="10" fill="#eff6ff" stroke="#2563eb" stroke-width="1.8"/>
+<text x="640" y="88" text-anchor="middle" font-size="13" font-weight="700" fill="#2563eb">通道二 Poll</text>
+<text x="640" y="106" text-anchor="middle" font-size="10" fill="#64748b">触发者：SDK 内置定时器</text>
+<text x="640" y="122" text-anchor="middle" font-size="9" fill="#2563eb">全部开关 · 30~60s</text>
+<text x="640" y="138" text-anchor="middle" font-size="15" fill="#2563eb">⏰</text>
+<line x1="530" y1="97" x2="500" y2="159" stroke="#2563eb" stroke-width="1.8" marker-end="url(#cb)"/>
+<text x="500" y="132" font-size="8" fill="#2563eb">闹</text>
+
+<!-- Bottom -->
+<rect x="130" y="204" width="500" height="28" rx="8" fill="#f8fafc" stroke="#e2e8f0" stroke-width="1"/>
+<text x="380" y="222" text-anchor="middle" font-size="11" fill="#334155">Push 和 Poll 只是 <tspan font-weight="700">两种叫醒方式</tspan>，数据路径（SDK ↔ Snapshot API）完全相同</text>
+</svg><div class="fig-cap">图 3 — Push = Redis 敲门，Poll = SDK 闹钟。叫醒方式不同，数据路径相同</div></div>
+
+<!-- ======== 4 ======== -->
+<h2>4. SDK 内部</h2>
+<p>业务开发者只看到一个对象两个方法。里面有三层逻辑加一个旁路同步器。</p>
+
+<div class="fig"><svg viewBox="0 0 740 310" width="740" height="310" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="SDK 内部三层：公开接口→条件匹配器→本地缓存，旁路同步控制器监听 Push 和 Poll 写缓存"><defs>
+<marker id="d" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0L8,3L0,6Z" fill="#94a3b8"/></marker></defs>
+
+<!-- SDK border -->
+<rect x="8" y="0" width="660" height="305" rx="14" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="8,4"/>
+<text x="28" y="26" font-size="12" font-weight="700" fill="#94a3b8">SDK 边界</text>
+
+<!-- Caller -->
+<rect x="60" y="34" width="360" height="32" rx="6" fill="#fff" stroke="#cbd5e1" stroke-width="1"/>
+<text x="240" y="55" text-anchor="middle" font-size="11" fill="#334155">业务代码：<tspan font-family="monospace" fill="#7c3aed">client.isEnabled("flag", user)</tspan></text>
+<line x1="240" y1="66" x2="240" y2="78" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#d)"/>
+
+<!-- ① -->
+<rect x="60" y="82" width="360" height="40" rx="7" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+<text x="240" y="106" text-anchor="middle" font-size="13" font-weight="700" fill="#2563eb">① 公开接口</text>
+<line x1="240" y1="122" x2="240" y2="134" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#d)"/>
+
+<!-- ② -->
+<rect x="60" y="138" width="360" height="40" rx="7" fill="#fff" stroke="#7c3aed" stroke-width="2"/>
+<text x="240" y="162" text-anchor="middle" font-size="13" font-weight="700" fill="#7c3aed">② 条件匹配器</text>
+<text x="240" y="178" text-anchor="middle" font-size="9" fill="#94a3b8">规则匹配 + 哈希分桶 → true/false</text>
+<line x1="240" y1="178" x2="240" y2="190" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#d)"/>
+
+<!-- ③ -->
+<rect x="60" y="194" width="360" height="52" rx="7" fill="#f0fdf4" stroke="#16a34a" stroke-width="2.5"/>
+<text x="240" y="218" text-anchor="middle" font-size="13" font-weight="700" fill="#16a34a">③ 本地缓存</text>
+<text x="240" y="238" text-anchor="middle" font-size="9" fill="#64748b">完整快照常驻内存 · 只读 · 约 2MB · 不淘汰</text>
+
+<!-- Sync Controller box -->
+<rect x="458" y="82" width="192" height="164" rx="10" fill="#fff" stroke="#cbd5e1" stroke-width="1.5"/>
+<text x="554" y="110" text-anchor="middle" font-size="13" font-weight="700" fill="#334155">同步控制器</text>
+<line x1="476" y1="120" x2="632" y2="120" stroke="#e2e8f0" stroke-width="1"/>
+
+<rect x="472" y="130" width="164" height="32" rx="5" fill="#fef2f2" stroke="#fecaca" stroke-width="1"/>
+<text x="554" y="145" text-anchor="middle" font-size="11" fill="#dc2626">通道一 Push</text>
+<text x="554" y="158" text-anchor="middle" font-size="9" fill="#64748b">Redis Pub/Sub 敲门</text>
+
+<rect x="472" y="170" width="164" height="32" rx="5" fill="#eff6ff" stroke="#bfdbfe" stroke-width="1"/>
+<text x="554" y="185" text-anchor="middle" font-size="11" fill="#2563eb">通道二 Poll</text>
+<text x="554" y="198" text-anchor="middle" font-size="9" fill="#64748b">定时器自动拉取</text>
+
+<text x="554" y="230" text-anchor="middle" font-size="9" fill="#94a3b8">从外部拉数据 → 写入缓存</text>
+
+<!-- Arrow sync→cache -->
+<line x1="453" y1="210" x2="425" y2="220" stroke="#94a3b8" stroke-width="2" marker-end="url(#d)"/>
+<text x="433" y="202" font-size="8" fill="#94a3b8">写入</text>
+
+<!-- Annotations -->
+<text x="240" y="268" text-anchor="middle" font-size="11" fill="#64748b">①②③ 跨语言共享 · 有一个 <tspan font-weight="700">Reference Impl (Rust/Go)</tspan> 跑全套 conformance test vectors，Java / JS / Swift SDK 在 CI 中与 Reference 对账，保证 hash 函数和规则语义 100% 一致</text>
+<text x="240" y="288" text-anchor="middle" font-size="11" fill="#64748b">同步控制器根据平台选择不同网络方式（Java 用 HTTP/Redis，Node 用 HTTP/WebSocket，移动端用静默推送），是写入缓存的旁路组件</text>
+</svg><div class="fig-cap">图 4 — 三层读链路 + 右侧同步控制器写入缓存</div></div>
+
+<p><b>移动端额外优化：</b>进程被杀是常态，每次冷启动如果只靠内存缓存就白拉一次完整快照（~1MB）。移动 SDK 把 snapshot + ETag 持久化到本地磁盘，下次冷启动先读本地 ETag 走 <code>If-None-Match</code>，snapshot 没变就 304 空响应，省掉 ~99% 的重复下载。</p>
+
+<!-- ======== 5 ======== -->
+<h2>5. 条件匹配器怎么工作</h2>
+<p>运营配置："<em>us-east-1 的企业租户中 20%</em>"。用户调用 <code>isEnabled()</code> 时执行两步：</p>
+
+<div class="fig"><svg viewBox="0 0 760 250" width="760" height="250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="条件匹配器两步评估：先规则过滤后哈希分桶；三用户示例"><defs>
+<marker id="e" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0L8,3L0,6Z" fill="#94a3b8"/></marker></defs>
+
+<!-- Step 1 -->
+<rect x="8" y="4" width="350" height="98" rx="10" fill="#f8fafc" stroke="#e2e8f0" stroke-width="1.5"/>
+<text x="183" y="28" text-anchor="middle" font-size="13" font-weight="700" fill="#334155">第一步：规则匹配</text>
+<text x="183" y="44" text-anchor="middle" font-size="9" fill="#94a3b8">所有 rules 必须满足（AND 语义）</text>
+<line x1="24" y1="52" x2="342" y2="52" stroke="#e2e8f0" stroke-width="1"/>
+
+<text x="38" y="74" font-size="11" fill="#64748b">region = "us-east-1"?</text>
+<text x="275" y="74" font-size="11" fill="#64748b">user.region = "us-east-1"</text>
+<text x="332" y="74" font-size="13" fill="#16a34a" font-weight="700">✓</text>
+
+<text x="38" y="94" font-size="11" fill="#64748b">tenant = "enterprise"?</text>
+<text x="275" y="94" font-size="11" fill="#64748b">user.tenant = "enterprise"</text>
+<text x="332" y="94" font-size="13" fill="#16a34a" font-weight="700">✓</text>
+
+<line x1="363" y1="53" x2="408" y2="53" stroke="#94a3b8" stroke-width="2" marker-end="url(#e)"/>
+
+<!-- Step 2 -->
+<rect x="413" y="4" width="339" height="98" rx="10" fill="#f8fafc" stroke="#e2e8f0" stroke-width="1.5"/>
+<text x="582" y="28" text-anchor="middle" font-size="13" font-weight="700" fill="#334155">第二步：哈希分桶</text>
+<text x="582" y="44" text-anchor="middle" font-size="9" fill="#94a3b8">确定是否在百分比范围内</text>
+<line x1="429" y1="52" x2="736" y2="52" stroke="#e2e8f0" stroke-width="1"/>
+
+<text x="445" y="74" font-size="11" fill="#64748b">"salt:checkout:U123" → xxhash64 % 100</text>
+<text x="582" y="98" text-anchor="middle" font-size="16" font-weight="700" fill="#7c3aed">bucket = 15, pct = 20</text>
+<text x="582" y="115" text-anchor="middle" font-size="12" fill="#16a34a" font-weight="700">15 &lt; 20 → true ✓</text>
+
+<!-- Bottom table -->
+<rect x="8" y="118" width="744" height="116" rx="10" fill="#f8fafc" stroke="#e2e8f0" stroke-width="1"/>
+<text x="380" y="142" text-anchor="middle" font-size="12" font-weight="700" fill="#334155">三个用户，不同结果</text>
+
+<text x="30" y="166" font-size="10" fill="#94a3b8" font-weight="600">用户</text>
+<text x="110" y="166" font-size="10" fill="#94a3b8" font-weight="600">region</text>
+<text x="200" y="166" font-size="10" fill="#94a3b8" font-weight="600">tenant</text>
+<text x="310" y="166" font-size="10" fill="#94a3b8" font-weight="600">规则</text>
+<text x="420" y="166" font-size="10" fill="#94a3b8" font-weight="600">哈希桶</text>
+<text x="540" y="166" font-size="10" fill="#94a3b8" font-weight="600">判定</text>
+<text x="660" y="166" font-size="10" fill="#94a3b8" font-weight="600">结果</text>
+
+<text x="30" y="190" font-size="10" fill="#334155">U123</text><text x="110" y="190" font-size="10" fill="#334155">us-east-1</text><text x="200" y="190" font-size="10" fill="#334155">enterprise</text><text x="310" y="190" font-size="10" fill="#16a34a">✓</text><text x="420" y="190" font-size="10" fill="#334155">15</text><text x="540" y="190" font-size="10" fill="#16a34a">15&lt;20 ✓</text><text x="660" y="190" font-size="11" fill="#16a34a" font-weight="700">true</text>
+<text x="30" y="206" font-size="10" fill="#334155">U456</text><text x="110" y="206" font-size="10" fill="#334155">us-west-2</text><text x="200" y="206" font-size="10" fill="#334155">enterprise</text><text x="310" y="206" font-size="10" fill="#dc2626">✗</text><text x="420" y="206" font-size="10" fill="#94a3b8">—</text><text x="540" y="206" font-size="10" fill="#94a3b8">—</text><text x="660" y="206" font-size="11" fill="#dc2626" font-weight="700">false</text>
+<text x="30" y="222" font-size="10" fill="#334155">U789</text><text x="110" y="222" font-size="10" fill="#334155">us-east-1</text><text x="200" y="222" font-size="10" fill="#334155">enterprise</text><text x="310" y="222" font-size="10" fill="#16a34a">✓</text><text x="420" y="222" font-size="10" fill="#334155">85</text><text x="540" y="222" font-size="10" fill="#dc2626">85≥20 ✗</text><text x="660" y="222" font-size="11" fill="#dc2626" font-weight="700">false</text>
+</svg><div class="fig-cap">图 5 — 规则缩小范围，哈希控制比例。两步都过才 true</div></div>
+
+<h3>type × rules × 灰度百分比 优先级</h3>
+<table>
+<caption>不同 flag type 的评估语义：rules 总是先求值（AND），失败直接 false；灰度百分比（pct 字段，即 percentage）只在 type 是 pct_rollout 时生效</caption>
+<thead><tr><th>type</th><th>rules 处理</th><th>百分比处理</th><th>最终返回</th></tr></thead>
+<tbody>
+<tr><td><code>boolean</code></td><td>跳过</td><td>跳过</td><td>看 <code>state</code>：<code>active</code> → true，否则 false</td></tr>
+<tr><td><code>targeting</code></td><td>AND 必须全过</td><td>跳过</td><td>全过 → true；任一失败 → false</td></tr>
+<tr><td><code>pct_rollout</code></td><td>AND 必须全过</td><td>hash(user, salt, flag) % 100 &lt; pct</td><td>全过且桶号小 → true；否则 false</td></tr>
+</tbody>
+</table>
+
+<!-- ======== 6 ======== -->
+<h2>6. API 设计</h2>
+<nav class="toc"><b>本节目录：</b>
+  <a href="#s61">6.1 数据面（SDK 拉快照）</a> ·
+  <a href="#s62">6.2 控制面（运营改 flag）</a> ·
+  <a href="#s63">6.3 核心模型</a> ·
+  <a href="#s64">6.4 rule 里的 op 词汇表</a> ·
+  <a href="#s65">6.5 definition 示例</a> ·
+  <a href="#s66">6.6 运维 API（/explain）</a>
+</nav>
+<h3 id="s61">6.1 数据面（给 SDK）</h3>
+<pre><code>GET /api/v1/snapshot
+  Header: Authorization: Bearer &lt;api_key&gt;     // app 身份从这里解析（api_key 绑应用，签名验证在 7.3 节）
+  Header: X-Env: production                    // 必填，指定要哪个环境的快照
+  Header: If-None-Match: "v42.7"               // ETag 缓存
+  → 200  { "version":"v42.7", "flags":[/* 仅本 app 可见的 flag */], "etag":"v42.7" }
+  → 304  (body 为空)</code></pre>
+<p><b>env 怎么传：</b>用 <code>X-Env</code> HTTP header 标明目标环境（生产 SDK 默认 <code>production</code>；staging SDK 在部署时通过环境变量切换）。不用 query 参数——避免 CDN 把同一 URL 当成不同 cache key 浪费命中率。</p>
+<p><b>app 怎么传：</b>不在请求里传，<b>从 api_key 反查</b>。每个 api_key 在 <code>applications</code> 表里绑死一个 app，请求进来先验证 api_key 拿到 <code>app_id</code>，再用 <code>app_id</code> 过滤可见 flag。这样 SDK 代码不用关心自己属于哪个 app，运营也不用在 SDK 部署时配置 app 名。</p>
+<p>一个接口，返 <b>本 app 可见的</b>最新快照（典型 50 条 flag，不是全量 10k 条）。走 CDN，ETag 缓存（类似浏览器缓存：服务端返回版本号，SDK 下次请求带这个号，没变化就回 304 空响应，有变化才传数据）。</p>
+
+<p><b>实现就一层薄薄的读：</b></p>
+<pre><code>// Snapshot API — 伪代码，实际就这些
+func HandleSnapshot(w, r):
+    api_key  = r.Header["Authorization"][len("Bearer "):]
+    app      = authenticate(api_key)                        // HMAC 校验 + 拿到 app_id
+    env      = require(r.Header["X-Env"])
+    key_data = fmt.Sprintf("snapshot:%s:%d:data", env, app.id)   // 每个 (env, app) 一份
+    key_ver  = fmt.Sprintf("snapshot:%s:%d:version", env, app.id)
+
+    // ETag 客户端带引号（HTTP spec），Redis 存的不带——必须 Trim 才能比对
+    if strings.Trim(r.Header["If-None-Match"], "\"") == redis.Get(key_ver):
+        w.WriteHeader(304)
+        return
+    flags = redis.Get(key_data)
+    w.Write(JSON{version: redis.Get(key_ver), flags: flags, etag: redis.Get(key_ver)})</code></pre>
+
+<p><b>关键：version 和 data 必须原子写。</b>如果分两次 SET，读端可能看到新 version + 旧 data（或反过来），SDK 缓存状态撕裂。用 Lua 在 Redis 端一次写两个 key：</p>
+<pre><code>-- Kafka consumer 每次重建快照后调一次（每个 (env, app) 一次）
+-- KEYS[1]=version key, KEYS[2]=data key, ARGV[1]=new_version, ARGV[2]=json
+redis.eval([[
+    redis.call('SET', KEYS[1], ARGV[1])
+    redis.call('SET', KEYS[2], ARGV[2])
+    return 1
+]], {key_ver, key_data}, {new_version, json_data})</code></pre>
+
+<p>Redis 里的 snapshot 数据是 Kafka consumer 写进去的——每次有 flag 变更或 app 可见范围变更，consumer 从 PostgreSQL 读出该 (env, app) 下所有可见 active flag，拼成快照 JSON，<b>通过上面 Lua 原子地</b>写入 Redis 的两个 key。consumer 要写 4 × N 个 (env, app) 组合，每次 flag 变更是 N 次写入而不是 1 次。</p>
+
+<p><b>一个具体例子（checkout-service 这个 app 看到的）：</b></p>
+<pre><code>// GET /api/v1/snapshot   Authorization: Bearer sk_live_xxx   X-Env: production   →   200 OK
+{
+  "version": "v42.7",
+  "etag": "v42.7",
+  "flags": [
+    { "key":"new_checkout",    "definition":{ "type":"pct_rollout","pct":20,"salt":"a3f9",... }},
+    { "key":"vip_discount",    "definition":{ "type":"boolean" }},
+    { "key":"admin_debug",     "definition":{ "type":"targeting","rules":[...] }}
+    // 仅本 app 可见的 50 条，不是全量 10k 条
+  ]
+}</code></pre>
+<p>就一份过滤后的 JSON，gzip 压缩后约 <b>20KB–80KB</b>（取决于本 app 可见 flag 数和 rules 复杂度）。不含 <code>version</code>、<code>state</code>、<code>owner</code>、<code>updated_at</code> 这些管理字段——SDK 只需要 <code>key</code> + <code>definition</code> 就够了，state 在 DB 列里管，snapshot 不带。</p>
+
+<p><b>CDN 还要不要：</b>要。CDN cache key 包含 app（解析自 api_key），缓存 <code>(env, app)</code> 组合。每个 cache key 的请求量从原来单 key 的 35M-50M/天 摊到 N 个 key，<b>热门 app 命中率仍 95%+，冷门 app 命中率低</b>。100 个 app 时总命中率 ~85%，可以接受；1000+ app 时需要分层（只对热门 app 走 CDN 缓存，冷门 app 直连 origin）。</p>
+
+<h3 id="s62">6.2 控制面（给后台管理）</h3>
+<pre><code>POST   /api/v1/flags                       创建
+PUT    /api/v1/flags/{key}                 更新（version 乐观锁，请求必须带 If-Match: "&lt;version&gt;"，更新时检查 version 是否还是旧值，防止两个运营同时改同一个开关互相覆盖）
+GET    /api/v1/flags                       搜索（分页：?cursor=&amp;limit=）
+GET    /api/v1/flags/{key}                 详情 + 历史
+DELETE /api/v1/flags/{key}                 软删除（state 置为 archived，snapshot 不再下发；保留 flags_history 用于 explain）
+POST   /api/v1/flags/{key}/rollout         灰度：0%→10%→50%→100%（专门改 pct）
+POST   /api/v1/flags/{key}/targeting       改 rules 数组（专门改定向条件）</code></pre>
+
+<p>rollout 不是什么复杂的状态机，就是一次普通的 flag 更新，只不过专门改 <code>pct</code>：</p>
+<pre><code>// POST /api/v1/flags/new_checkout/rollout   body: {"pct": 50, "expected_version": 41}
+
+BEGIN;
+  UPDATE flags SET version = version + 1,
+      definition = jsonb_set(definition, '{pct}', '50'::jsonb),  -- 必须 ::jsonb cast，否则存成字符串
+      updated_at = now()
+  WHERE key = 'new_checkout' AND env = 'production' AND version = 41;
+  -- 0 rows affected → 返回 412 Precondition Failed
+
+  INSERT INTO flags_history (flag_key, env, version, definition, changed_by)
+  VALUES ('new_checkout', 'production', 42,
+          (SELECT definition FROM flags WHERE key='new_checkout'), 'alice');
+COMMIT;</code></pre>
+<p>本质上和 <code>PUT /api/v1/flags/{key}</code> 做的事一样——乐观锁更新 + 写历史。单独拆一个 <code>/rollout</code> 只是为了让运营操作更直观，不用懂整个 JSON 结构。</p>
+
+<h3 id="s63">6.3 核心模型</h3>
+<pre><code>-- DB flags 行（state/version 走列，不进 JSONB definition）
+key="new_checkout_flow", env="production", version=42, state="active",
+critical=false, owner="checkout-team", release="v3.2.0",
+definition = {                              -- JSONB
+  "type":"pct_rollout", "pct":20, "salt":"a3f9c2e1",
+  "rules":[
+    {"attr":"region","op":"in","values":["us-east-1"]},
+    {"attr":"tenant","op":"eq","value":"enterprise"}
+  ]
+}</code></pre>
+<p>rules 为 AND 语义，全部满足后 pct 生效，即"满足规则的人中的 pct%"。<b>state 和 version 在 DB 列管，不写进 definition JSON</b>——避免双写导致数据漂移。</p>
+
+<h3 id="s64">6.4 rule 里的 <code>op</code> 词汇表</h3>
+<table>
+<caption>SDK 必须支持完整 op 集合；运营在管理后台写规则时只能选这些，不能自由输入</caption>
+<thead><tr><th>op</th><th>含义</th><th>示例</th></tr></thead>
+<tbody>
+<tr><td><code>eq</code> / <code>ne</code></td><td>等于 / 不等于</td><td><code>{"op":"eq","value":"enterprise"}</code></td></tr>
+<tr><td><code>in</code> / <code>not_in</code></td><td>属于 / 不属于集合</td><td><code>{"op":"in","values":["us-east-1","us-west-2"]}</code></td></tr>
+<tr><td><code>gt</code> / <code>gte</code> / <code>lt</code> / <code>lte</code></td><td>数值比较</td><td><code>{"op":"gte","value":18}</code></td></tr>
+<tr><td><code>contains</code></td><td>字符串包含</td><td><code>{"op":"contains","value":"premium"}</code></td></tr>
+<tr><td><code>starts_with</code></td><td>字符串前缀</td><td><code>{"op":"starts_with","value":"ios_"}</code></td></tr>
+<tr><td><code>regex</code></td><td>正则（用 RE2 语法，避免 ReDoS）</td><td><code>{"op":"regex","value":"^vip_.*"}</code></td></tr>
+<tr><td><code>exists</code></td><td>属性非空</td><td><code>{"op":"exists"}</code></td></tr>
+</tbody>
+</table>
+<p>SDK 启动时校验：遇到不认识的 op 直接 fail-fast，不静默忽略——否则 5% 的 flag 用新 op 但 SDK 旧，会被静默关掉。</p>
+
+<h3 id="s65">6.5 definition 示例：三种典型开关</h3>
+
+<p><b>① 全站开关</b>——是否启用看 DB 列 <code>state</code>，<code>active</code> 即 true，<code>archived</code> 即 false。definition 里只标 type。</p>
+<pre><code>{ "type": "boolean" }</code></pre>
+
+<p><b>② 百分比灰度</b>——"10% 用户看到"，salt 保证各开关的灰度用户互相独立</p>
+<pre><code>{ "type": "pct_rollout", "pct": 10, "salt": "a3f9c2e1" }</code></pre>
+
+<p><b>③ 定向规则</b>——"只给 admin 角色看"</p>
+<pre><code>{
+  "type": "targeting",
+  "rules": [{ "attr": "role", "op": "eq", "value": "admin" }]
+}</code></pre>
+
+<p><b>④ 混合</b>——规则过滤 + 百分比，最常用的形式</p>
+<pre><code>{
+  "type": "pct_rollout",
+  "pct": 20,
+  "salt": "a3f9c2e1",
+  "rules": [
+    { "attr": "region",    "op": "in", "values": ["us-east-1"] },
+    { "attr": "tenant",    "op": "eq", "value": "enterprise" },
+    { "attr": "beta_user", "op": "eq", "value": true }
+  ]
+}</code></pre>
+
+<p>条件匹配器就是一段几十行的 if/else：先跑 rules（AND 语义，一条不满足就返回 false），全过了再按 type 处理——优先级见上面的"type × rules × pct"真值表。</p>
+
+<h3 id="s66">6.6 运维 API（/explain）</h3>
+
+<p>用户报障说"昨天 14:00 我没看到新收银台"——运营拿这个 API 一查就能给用户解释。</p>
+
+<p><b>API 长这样（用就是这一行）：</b></p>
+<pre><code>GET /api/v1/explain?flag=new_checkout&amp;user=U123&amp;at=2026-06-24T14:00:00Z
+
+→ 200
+{
+  "enabled": false,                              ← U123 当时看到的
+  "reason":  "用户 bucket=15，但 14:00 时 flag 是 10% 灰度，15 ≥ 10 → false",
+  "flag_version": 41,                            ← 当时用的是哪个版本
+  "user_context": { "region": "us-west-2", "tenant": "enterprise" }   ← 当时 U123 的资料
+}</code></pre>
+
+<p><b>怎么算出来的：</b>不存"当时是 true 还是 false"（100K QPS 一天 864 GB，存不起）。只存 flag 每次被改的版本（一天顶多几百次）。问的时候拿<b>当时那条 flag 定义</b> + <b>当时那个用户的资料</b>重新跑评估——结果跟当时一模一样，因为评估是纯本地算的（hash 桶号 + 规则 AND），同样的输入永远出同样的输出。整个 history 表 7 年下来也就 50–500 MB。</p>
+
+<p><b>唯一搞不定的：</b>flag 的 salt 后来被改过——重算用的盐已经不是当时那个，桶号会变。这时返回"无法精确回答，去 audit_log 查"。</p>
+
+<div class="fig"><svg viewBox="0 0 760 170" width="760" height="170" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Explain 查询流程：用户查询 → 查历史版本 → 重放计算 → 返回结果"><defs>
+<marker id="f" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0L8,3L0,6Z" fill="#94a3b8"/></marker></defs>
+
+<rect x="8" y="8" width="160" height="58" rx="8" fill="#fff" stroke="#cbd5e1" stroke-width="1.5"/>
+<text x="88" y="32" text-anchor="middle" font-size="12" font-weight="700" fill="#334155">🔍 问</text>
+<text x="88" y="50" text-anchor="middle" font-size="10" fill="#64748b">U123 昨天 14:00 看到啥？</text>
+
+<line x1="173" y1="37" x2="218" y2="37" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#f)"/>
+
+<rect x="223" y="8" width="140" height="58" rx="8" fill="#f5f3ff" stroke="#7c3aed" stroke-width="1.8"/>
+<text x="293" y="32" text-anchor="middle" font-size="12" font-weight="700" fill="#7c3aed">拿当时的输入</text>
+<text x="293" y="50" text-anchor="middle" font-size="10" fill="#64748b">flag 定义(v41) + U123 资料</text>
+
+<line x1="368" y1="37" x2="413" y2="37" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#f)"/>
+
+<rect x="418" y="8" width="140" height="58" rx="8" fill="#f5f3ff" stroke="#7c3aed" stroke-width="1.8"/>
+<text x="488" y="32" text-anchor="middle" font-size="12" font-weight="700" fill="#7c3aed">重跑评估</text>
+<text x="488" y="50" text-anchor="middle" font-size="10" fill="#64748b">跟当时一样的算法</text>
+
+<line x1="563" y1="37" x2="608" y2="37" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#f)"/>
+
+<rect x="613" y="8" width="139" height="58" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="2"/>
+<text x="682" y="30" text-anchor="middle" font-size="11" fill="#334155">结果</text>
+<text x="682" y="50" text-anchor="middle" font-size="14" font-weight="700" fill="#16a34a">false</text>
+
+<!-- Bottom comparison -->
+<rect x="80" y="88" width="600" height="32" rx="8" fill="#f8fafc" stroke="#e2e8f0" stroke-width="1"/>
+<text x="230" y="108" text-anchor="middle" font-size="12" fill="#dc2626">❌ 存每次结果：864 GB/天</text>
+<text x="530" y="108" text-anchor="middle" font-size="12" fill="#16a34a">✅ 存 flag 改动：50–500 MB</text>
+
+<text x="380" y="145" text-anchor="middle" font-size="11" fill="#64748b">API 挂在 Management API（控制面），不在 Snapshot API（数据面）</text>
+</svg><div class="fig-cap">图 6 — 不存每次结果，只存 flag 改动，问的时候重算</div></div>
+
+<!-- ======== 7 ======== -->
+<h2>7. 数据库设计</h2>
+<pre><code>CREATE TABLE flags (
+    key         VARCHAR(128),
+    env         VARCHAR(16) NOT NULL DEFAULT 'production',
+    version     INTEGER NOT NULL,               -- 乐观锁
+    state       VARCHAR(16) NOT NULL DEFAULT 'active',  -- active | archived（不进 JSONB definition）
+    definition  JSONB NOT NULL,                 -- 只有 type/pct/salt/rules
+    critical    BOOLEAN NOT NULL DEFAULT false,
+    owner       VARCHAR(64),
+    updated_at  TIMESTAMP NOT NULL DEFAULT now(),
+    PRIMARY KEY (key, env),
+    CHECK (env IN ('dev','staging','production','preprod')),
+    CHECK (state IN ('active','archived'))
+);
+
+-- flags_history：复合主键 + FK 引用 flags，避免并发写重复行和历史漂移
+CREATE TABLE flags_history (
+    flag_key    VARCHAR(128) NOT NULL,
+    env         VARCHAR(16) NOT NULL,
+    version     INTEGER NOT NULL,
+    definition  JSONB NOT NULL,
+    changed_by  VARCHAR(64),
+    changed_at  TIMESTAMP NOT NULL DEFAULT now(),
+    PRIMARY KEY (flag_key, env, version),       -- 一个 (flag, env) 的每个 version 只能一行
+    FOREIGN KEY (flag_key, env) REFERENCES flags(key, env) ON DELETE CASCADE
+);
+CREATE INDEX idx_hist_time ON flags_history(flag_key, env, changed_at DESC);
+-- flags_history 不删：audit 要求保留 ≥7 年；超过 1 年的冷数据按月 partition + 归档到 S3</code></pre>
+<p>改开关时一个事务：乐观锁更新 flags + INSERT flags_history。FK 兜底——运营 typo 出错（比如 key 多打一个字母）会直接报 FK violation，不会留下孤儿历史行。</p>
+
+<h3>环境怎么处理？</h3>
+<p>同一个开关在 staging 放 50%、production 还是 0%，不同环境值不同。做法很简单：<b>把 <code>env</code> 加到 flags 表主键里</b>，一行 = 一个开关在一个环境里的配置。4 个环境（dev/staging/preprod/production），每个开关最多 4 行。</p>
+
+<h3>Flag → App 可见范围</h3>
+<pre><code>-- 每个 flag 在每个 env 下显式列出可见的 app；不在这张表里的 (flag, env, app) 默认不可见
+CREATE TABLE flag_app_scopes (
+    flag_key  VARCHAR(128) NOT NULL,
+    env       VARCHAR(16) NOT NULL,
+    app_id    INTEGER NOT NULL REFERENCES applications(id) ON DELETE CASCADE,
+    PRIMARY KEY (flag_key, env, app_id)
+);
+CREATE INDEX idx_scope_app ON flag_app_scopes(app_id, env);</code></pre>
+<p><b>作用：</b>运营创建/改 flag 时勾选哪些 app 可见（"checkout-service 和 payment-service 能看，其他都看不到"）。Snapshot API 按 api_key 解析出 <code>app_id</code>，JOIN 这张表过滤可见 flag。10k flag × 100 app × 4 env = 4M 行，多对多表完全撑得住。</p>
+<p><b>顺带解决了 flag key 重名问题：</b>两个 team 各自取名 <code>new_ui</code>，只要它们的 flag 绑不同 app，snapshot 不会冲突。原先要求 <code>flags</code> PK 是 <code>(key, env)</code> 的硬性约束现在更宽松——key 重名但 app 不同的两个 flag 互不影响。</p>
+
+<h3>应用 + 凭证</h3>
+<pre><code>-- 服务级身份：SDK 用 api_key 调 Snapshot API
+-- user-level 身份：走 SSO/OIDC（不是这张表管），audit_log.actor 来自 user 层
+CREATE TABLE applications (
+    id            SERIAL PRIMARY KEY,
+    team          VARCHAR(64) NOT NULL,        -- 所属团队（多团队隔离命名）
+    name          VARCHAR(64) NOT NULL,        -- "checkout-service"
+    env_scope     VARCHAR(16) NOT NULL DEFAULT 'production',  -- key 绑 env，限制误用
+    api_key_hash  VARCHAR(255) NOT NULL,       -- bcrypt/argon2 哈希，不存明文
+    api_key_prefix VARCHAR(16) NOT NULL UNIQUE,-- 存 key 前 8 位方便运维识别（不存全 key）
+    owner         VARCHAR(64),
+    created_at    TIMESTAMP NOT NULL DEFAULT now(),
+    UNIQUE (team, name),                       -- 避免不同 team 撞同名 service
+    CHECK (env_scope IN ('dev','staging','production','preprod'))
+);</code></pre>
+<p><b>为什么存哈希：</b>明文存 api_key → 任何能 SELECT 这张表的人都拿走所有服务凭证 → 任一 service 被攻破全部沦陷。bcrypt 哈希后比对慢（~100ms），但 Snapshot API 路径可以加内存 cache 兜性能。</p>
+
+<h3>API Key 怎么用（HMAC 哈希）</h3>
+<p>API key 是 256 位高熵随机串，HMAC-SHA256(server_secret, raw_key) 哈希后存 <code>api_key_hash</code>。DB dump 出去也还原不出明文，<code>api_key_hash</code> 列加 UNIQUE 直接按 hash 查找。server_secret 单独存 Vault，运行时注入。</p>
+
+<p><b>注册（一次性）：</b>运营通过内部管理后台（带 SSO 登录）调用 <code>POST /api/v1/admin/applications</code>，body 是 <code>(team, name, env_scope)</code>，不用脚本，也不在外网开放。</p>
+<pre><code>// register-application(team, name, env_scope)
+raw_key = "sk_live_" + crypto_random(24)              // 32 字节明文，只显示这一次
+hash    = HMAC-SHA256(SERVER_SECRET, raw_key)         // μs 级
+INSERT INTO applications (team, name, env_scope, api_key_hash, ...)
+  VALUES (?, ?, ?, hash, ...);
+return raw_key     // 运营存进 vault，DB 再无明文</code></pre>
+
+<p><b>每次请求验证：</b></p>
+<pre><code>// Snapshot API 入口
+submitted = r.Header["Authorization"][len("Bearer "):]   // 完整 key
+hash      = HMAC-SHA256(SERVER_SECRET, submitted)
+row       = SELECT id, env_scope, revoked_at
+            FROM applications WHERE api_key_hash = hash  -- UNIQUE 索引，O(1)
+if row is null:                       return 401
+if row.revoked_at != null:            return 401         -- 撤销
+if row.env_scope != requested_env:    return 403         -- key 绑 env，越权
+// 验证通过</code></pre>
+
+<p><b>旋转 / 撤销：</b></p>
+<pre><code>-- 运营主动 rotate
+UPDATE applications SET revoked_at = now() WHERE id = ?;        -- 老 key 立即死
+INSERT INTO applications (..., api_key_hash)                    -- 新 key 入库
+  VALUES (..., HMAC-SHA256(SERVER_SECRET, new_raw_key));
+-- SDK 收到 401 后去 vault 读新 key，零停机</code></pre>
+
+<p>撤销后老的 hash 仍在表里，靠 <code>revoked_at</code> 过滤；rotate 就是改 <code>revoked_at</code> + 插新行。</p>
+
+<h3>审计日志</h3>
+<pre><code>CREATE TABLE audit_log (
+    id          BIGSERIAL PRIMARY KEY,
+    actor       VARCHAR(64) NOT NULL,                 -- 来自 user auth (SSO/OIDC)，不是 api_key
+    action      VARCHAR(32) NOT NULL,                 -- 见下方 CHECK
+    target      VARCHAR(128) NOT NULL,                -- flag_key 或 (app team/name)
+    detail      JSONB,                                -- 变更细节（体积限 8KB）
+    ip_address  INET,
+    created_at  TIMESTAMP NOT NULL DEFAULT now(),
+    CHECK (action IN ('created','updated','rolled_out','targeted','archived','queried','login'))
+);
+CREATE INDEX idx_audit_actor_time ON audit_log(actor, created_at DESC);
+CREATE INDEX idx_audit_target     ON audit_log(target, created_at DESC);</code></pre>
+<p><b>两层身份必须分清：</b><code>api_key</code> 是"哪个服务在调"（machine auth），<code>actor</code> 是"哪个人在操作"（user auth）。一个 service key 不能伪装成"alice"——actor 由 SSO/OIDC 注入，request 走 JWT 带 <code>sub</code> claim 进来，audit 不会被服务被攻破而污染。</p>
+<p><b>保留多久：</b>两类分开——改 flag 的记录留 7 年（财务审计要查这么久），"谁查了 flag" 这种读操作的记录 30 天后转到 S3（量太大，DB 存不起）。</p>
+<p><b>怎么查：</b>出事后想知道谁干的，按"操作人 + 时间"或"改的是哪个 flag + 时间"过滤就够。</p>
+<p><b>紧急回滚：</b>核心 flag 被误推到 100% 时，先 <code>UPDATE flags SET state='archived'</code>（snapshot 秒级不再下发这个 flag，<b>archive 不等于 delete</b>，历史还在），再走 /rollout 回滚到上一个版本。</p>
+
+<table>
+<caption>四张主表的数据量估算（按 10k flag × 4 env 计）</caption>
+<thead><tr><th>表</th><th>行数</th><th>大小</th><th>用途</th></tr></thead>
+<tbody>
+<tr><td>flags</td><td>40k</td><td>~15 MB</td><td>当前生效配置（含全部 env）</td></tr>
+<tr><td>flags_history</td><td>200k–2M</td><td>50–500 MB</td><td>版本历史。10 versions 是新 flag 保守估计，50 versions 是 1 年以上老 flag 实际值；2 年以上需要 partition+归档 S3</td></tr>
+<tr><td>applications</td><td>100–500</td><td>可忽略</td><td>服务凭证（哈希后）</td></tr>
+<tr><td>audit_log</td><td>~10M/年</td><td>~5 GB/年</td><td>完整审计；query 类按月归档</td></tr>
+<tr><td><b>合计（热数据）</b></td><td></td><td><b>~60 MB–1 GB</b></td><td></td></tr>
+</tbody>
+</table>
+
+<!-- ======== 8 ======== -->
+<h2>8. 可观测性</h2>
+<table>
+<caption>SDK 端内置的四个核心指标 + 告警阈值（alert 阈值不写在 doc 里就没人在 oncall）</caption>
+<thead><tr><th>运维问</th><th>指标</th><th>告警规则</th><th>响应</th></tr></thead>
+<tbody>
+<tr><td>"SDK 用的是最新配置吗？"</td><td><code>snapshot_version</code>、<code>snapshot_age_seconds</code></td><td>任何 instance 的 <code>snapshot_age &gt; 120s</code></td><td>page oncall（说明某个 SDK 卡在旧版本）</td></tr>
+<tr><td>"评估会不会太慢？"</td><td><code>eval_duration_us</code> 直方图</td><td>p99 &gt; 1ms（设计值是 μs 级，1ms 已经是规则爆炸）</td><td>开 ticket，看哪个 flag 规则变复杂了</td></tr>
+<tr><td>"哪个开关用得最多？"</td><td><code>eval_total{flag, result}</code> 计数器</td><td>7 天零评估的 flag &gt; 100 个</td><td>提示 archive 候选</td></tr>
+<tr><td>"跨区同步正常吗？"</td><td><code>redis_replication_lag_seconds</code></td><td>&gt; 30s 持续 5min</td><td>page oncall（CDC/Kafka 出问题）</td></tr>
+</tbody>
+</table>
+<p>SDK 进程内累加，Prometheus（监控系统）定期 scrape（采集），不在每次 <code>isEnabled()</code> 时发网络请求。</p>
+
+<!-- ======== 9 ======== -->
+<h2>9. 关键决策总结</h2>
+<table>
+<caption>关键决策及代价（每行都是权衡）</caption>
+<thead><tr><th>决策</th><th>为什么</th><th>放弃什么</th></tr></thead>
+<tbody>
+<tr><td>缓存定义，不缓存结果</td><td>调 isEnabled() 时无网络请求，管理后台挂了，SDK 照样用本地缓存在评估</td><td>每实例 2MB 内存</td></tr>
+<tr><td>Push + Poll 双通道</td><td>紧急秒级生效，普通低成本</td><td>不保证所有 SDK 同一时刻看到完全相同的配置（最坏 60s 延迟）</td></tr>
+<tr><td>哈希分桶 + salt</td><td>纯本地，桶独立不关联</td><td>换算法需重部署</td></tr>
+<tr><td>确定性重放</td><td>50–500MB 一次性 vs 864GB/天日志</td><td>不含用户上下文变化（用 1% 采样兜底）</td></tr>
+<tr><td>Per-app Snapshot + CDN</td><td>每个 app 只看到自己可见的 flag，顺带解决跨 team flag key 重名；CDN 边缘仍可缓存 (env, app) 维度</td><td>CDN cache key 数从 4 个变成 4×N 个，100 app 时总命中率 ~85%；1000+ app 需要分层只缓存热门 app</td></tr>
+</tbody>
+</table>
+
+<p><b>1000+ app 时怎么再演进：</b>CDN cache 命中率降到 70% 以下时，按 app 热度分层——热门 app（前 100）继续走 CDN 全量缓存，冷门 app 直接 origin（origin 加一层进程内 LRU 缓存兜底），避免 N 个冷 cache key 浪费边缘内存。</p>
+
+<!-- ======== 10 ======== -->
+<h2>10. 实现顺序</h2>
+<div class="b-key"><ol class="s">
+<li><b>Flag 模型 + 版本化存储</b> — PostgreSQL 三张表（flags / flags_history / flag_app_scopes）+ 建表 migration</li>
+<li><b>Management API</b> — 控制面 CRUD（创建/更新/删除/搜索开关）</li>
+<li><b>Snapshot API</b> — GET + ETag，不到 100 行</li>
+<li><b>条件匹配器</b> — 规则匹配 + 哈希分桶，不到 200 行</li>
+<li><b>SDK 演示</b> — 内置定时器轮询 Snapshot + 条件匹配器评估</li>
+<li><b>Explain API</b> — 历史版本查找 + 重放</li>
+<li><b>Push 通道</b> — Redis Pub/Sub 推变更信号，SDK 收到后拉快照</li>
+</ol></div>
+<p style="color:var(--c1);font-size:14px">核心洞察——<b>本地评估 + 确定性重放</b>——几百行代码就能跑通端到端最小可用版本。</p>
+</main>
+</body>
+</html>

@@ -1,0 +1,16 @@
+# H2 database files
+data/
+
+# Maven
+target/
+
+# IntelliJ IDEA
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Spring Boot
+*.log

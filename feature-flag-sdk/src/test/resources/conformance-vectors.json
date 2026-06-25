@@ -1,0 +1,113 @@
+{
+  "version": 2,
+  "vectors": [
+    {
+      "name": "boolean_true",
+      "definition": {"key": "f", "type": "boolean"},
+      "context": {"userId": "u1", "attributes": {}},
+      "expected": true
+    },
+    {
+      "name": "boolean_false",
+      "definition": {"key": "f", "type": "boolean"},
+      "context": {"userId": "u1", "attributes": {}},
+      "expected": true
+    },
+    {
+      "name": "pct_zero",
+      "definition": {"key": "f", "type": "pct_rollout", "pct": 0, "salt": "s"},
+      "context": {"userId": "u1", "attributes": {}},
+      "expected": false
+    },
+    {
+      "name": "pct_hundred",
+      "definition": {"key": "f", "type": "pct_rollout", "pct": 100, "salt": "s"},
+      "context": {"userId": "u1", "attributes": {}},
+      "expected": true
+    },
+    {
+      "name": "targeting_admin_match",
+      "definition": {
+        "key": "f", "type": "targeting",
+        "rules": [{"attribute": "role", "op": "eq", "values": ["admin"]}],
+        "default": false
+      },
+      "context": {"userId": "u1", "attributes": {"role": "admin"}},
+      "expected": true
+    },
+    {
+      "name": "targeting_admin_no_match_default_false",
+      "definition": {
+        "key": "f", "type": "targeting",
+        "rules": [{"attribute": "role", "op": "eq", "values": ["admin"]}],
+        "default": false
+      },
+      "context": {"userId": "u1", "attributes": {"role": "user"}},
+      "expected": false
+    },
+    {
+      "name": "targeting_admin_no_match_default_true",
+      "definition": {
+        "key": "f", "type": "targeting",
+        "rules": [{"attribute": "role", "op": "eq", "values": ["admin"]}],
+        "default": true
+      },
+      "context": {"userId": "u1", "attributes": {"role": "user"}},
+      "expected": true
+    },
+    {
+      "name": "targeting_multiple_rules_and",
+      "definition": {
+        "key": "f", "type": "targeting",
+        "rules": [
+          {"attribute": "country", "op": "eq", "values": ["US"]},
+          {"attribute": "age", "op": "gte", "values": [18]}
+        ],
+        "default": false
+      },
+      "context": {"userId": "u1", "attributes": {"country": "US", "age": 25}},
+      "expected": true
+    },
+    {
+      "name": "targeting_multiple_rules_one_fails",
+      "definition": {
+        "key": "f", "type": "targeting",
+        "rules": [
+          {"attribute": "country", "op": "eq", "values": ["US"]},
+          {"attribute": "age", "op": "gte", "values": [18]}
+        ],
+        "default": false
+      },
+      "context": {"userId": "u1", "attributes": {"country": "US", "age": 10}},
+      "expected": false
+    },
+    {
+      "name": "pct_10_alice_bucket94",
+      "definition": {"key": "checkout_v2", "type": "pct_rollout", "pct": 10, "salt": "checkout"},
+      "context": {"userId": "alice@example.com", "attributes": {}},
+      "expected": false
+    },
+    {
+      "name": "pct_10_bob_bucket6_inside",
+      "definition": {"key": "checkout_v2", "type": "pct_rollout", "pct": 10, "salt": "checkout"},
+      "context": {"userId": "bob@example.com", "attributes": {}},
+      "expected": true
+    },
+    {
+      "name": "pct_5_bob_bucket6_above",
+      "definition": {"key": "checkout_v2", "type": "pct_rollout", "pct": 5, "salt": "checkout"},
+      "context": {"userId": "bob@example.com", "attributes": {}},
+      "expected": false
+    },
+    {
+      "name": "unknown_op_fails_closed",
+      "definition": {
+        "key": "f", "type": "targeting",
+        "rules": [{"attribute": "x", "op": "weird", "values": [1]}],
+        "default": true
+      },
+      "context": {"userId": "u1", "attributes": {"x": 1}},
+      "expected": true
+    }
+  ]
+}

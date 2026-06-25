@@ -1,0 +1,36 @@
+server:
+  port: 8090
+
+spring:
+  application:
+    name: snapshot-api
+  datasource:
+    url: ${DATASOURCE_URL:jdbc:h2:file:./data/featureflags;MODE=PostgreSQL;AUTO_SERVER=TRUE;DB_CLOSE_DELAY=-1}
+    username: ${DATASOURCE_USER:sa}
+    password: ${DATASOURCE_PASSWORD:}
+    driver-class-name: ${DATASOURCE_DRIVER:org.h2.Driver}
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:9092}
+    consumer:
+      group-id: ${KAFKA_CONSUMER_GROUP:snapshot-builder}
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        spring.json.trusted.packages: com.example.snapshotapi.event
+        spring.json.use.type.headers: false
+        spring.json.value.default.type: com.example.snapshotapi.event.FlagChangeEvent
+
+ff:
+  server-secret: ${FF_SERVER_SECRET:change-me-32-bytes-of-secret!!!}
+  kafka:
+    # Topic produced by the PG CDC stream (e.g. Debezium) — every flag / scope
+    # change emits one event. The consumer rebuilds the affected (env, app)
+    # snapshot in Redis. See FlagChangeConsumer.
+    topic-flag-changes: ${KAFKA_TOPIC_FLAG_CHANGES:ff.flag.changes}
+    consumer-group:     ${KAFKA_CONSUMER_GROUP:snapshot-builder}
+  # Redis key naming convention: snapshot:{env}:{app_id}:{data,version}

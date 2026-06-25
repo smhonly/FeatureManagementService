@@ -1,0 +1,24 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: management-api
+  datasource:
+    url: ${DATASOURCE_URL:jdbc:h2:file:./data/featureflags;MODE=PostgreSQL;AUTO_SERVER=TRUE;DB_CLOSE_DELAY=-1}
+    username: ${DATASOURCE_USER:sa}
+    password: ${DATASOURCE_PASSWORD:}
+    driver-class-name: ${DATASOURCE_DRIVER:org.h2.Driver}
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+ff:
+  server-secret: ${FF_SERVER_SECRET:change-me-32-bytes-of-secret!!!}
+  jwt-secret:    ${FF_JWT_SECRET:change-me-jwt-hmac-secret!!}
+  auth:
+    # Control-plane auth (design §7: SSO/OIDC for user identity).
+    # Both default to false ONLY for first-run / local development convenience.
+    # Production MUST set ff.auth.jwt-enabled=true.
+    jwt-enabled: ${FF_AUTH_JWT_ENABLED:false}
+    hmac-enabled: ${FF_AUTH_HMAC_ENABLED:false}

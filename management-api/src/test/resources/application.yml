@@ -1,0 +1,18 @@
+spring:
+  datasource:
+    url: jdbc:h2:mem:ff;MODE=PostgreSQL;DB_CLOSE_DELAY=-1
+    username: sa
+    password:
+    driver-class-name: org.h2.Driver
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+ff:
+  server-secret: test-server-secret-32-bytes-of-pad!
+  jwt-secret:    test-jwt-hmac-secret-32-bytes!!
+  auth:
+    # Tests must explicitly disable both auth filters. Production should
+    # NEVER run with these both off — see FlagControllerTest setup comments.
+    jwt-enabled: false
+    hmac-enabled: false

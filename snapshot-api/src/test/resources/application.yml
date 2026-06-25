@@ -1,0 +1,12 @@
+spring:
+  datasource:
+    url: jdbc:h2:mem:snapshot;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE
+    username: sa
+    password:
+  data:
+    redis:
+      host: localhost
+      port: 6379
+
+ff:
+  server-secret: test-server-secret-32-bytes-of-pad!
