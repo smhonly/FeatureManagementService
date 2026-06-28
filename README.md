@@ -1,78 +1,78 @@
 # Feature Management Service
 
-100+ 应用 · 10,000+ 开关 · 100K QPS · P99 < 10ms
+100+ apps · 10,000+ flags · 100K QPS · P99 < 10ms
 
-三个核心决策：
-1. **缓存开关定义**（非评估结果），SDK 本地执行 → `isEnabled()` 无网络请求
-2. **稳定哈希分桶 + salt** 做百分比灰度 → 同用户永远同桶
-3. **确定性重放**替代评估日志 → 存版本历史(~50MB) vs 日志(864GB/天)
+Three core decisions:
+1. **Cache flag definitions** (not evaluation results); the SDK evaluates locally → `isEnabled()` never hits the network
+2. **Stable hash bucketing + salt** for percentage rollouts → the same user always lands in the same bucket
+3. **Deterministic replay** replaces evaluation logs → store version history (~50 MB) instead of logs (864 GB/day)
 
-详见 `docs/design.md`（英文）和 `docs/design.html`（中文 + SVG 图）。
-
----
-
-## 项目结构
-
-```
-feature-flag-sdk/     Java 21 SDK（纯 stdlib + Jackson + Jedis optional）
-management-api/       Spring Boot 3.3 控制面（CRUD、auth、/explain）
-snapshot-api/         Spring Boot 3.3 数据面（GET /snapshot + ETag + Pub/Sub）
-e2e-tests/            端到端测试（起两个服务 + 内嵌 Redis + 共享 H2）
-docs/                 design.md / design.html 架构设计文档
-```
-
-四个 Maven 模块，统一父 POM。
+See `docs/design.md` (English) and `docs/design.html` (Chinese + SVG diagrams).
 
 ---
 
-## 快速开始
+## Project structure
 
-**前置条件：** JDK 21、Maven 3.8+
+```
+feature-flag-sdk/     Java 21 SDK (pure stdlib + Jackson + Jedis optional)
+management-api/       Spring Boot 3.3 control plane (CRUD, auth, /explain)
+snapshot-api/         Spring Boot 3.3 data plane (GET /snapshot + ETag + Pub/Sub)
+e2e-tests/            End-to-end tests (boots both services + embedded Redis + shared H2)
+docs/                 design.md / design.html architecture documents
+```
 
-运行服务需要 Redis 7+（见步骤 2）。**跑测试不需要** —— e2e 测试自带内嵌 Redis。
+Four Maven modules under one parent POM.
 
-### 1. 构建全部模块
+---
+
+## Quick start
+
+**Prerequisites:** JDK 21, Maven 3.8+
+
+Running the services needs Redis 7+ (see step 2). **Running the tests does not** — the e2e tests bring their own embedded Redis.
+
+### 1. Build all modules
 
 ```bash
-# 编译安装 SDK（其他模块依赖它）
+# Compile and install the SDK (other modules depend on it)
 mvn install -f feature-flag-sdk/pom.xml -DskipTests
 
-# 运行全部测试（含 e2e）
+# Run all tests (including e2e)
 mvn test
 ```
 
-### 2. 启动 Redis
+### 2. Start Redis
 
 ```bash
 docker run -d --name ff-redis -p 6379:6379 redis:7
 ```
 
-### 3. 启动 management-api（控制面，先启动 — Flyway 建表）
+### 3. Start management-api (control plane — start this first; Flyway creates the tables)
 
 ```bash
 mvn spring-boot:run -f management-api/pom.xml
 ```
 
-### 4. 启动 snapshot-api（数据面）
+### 4. Start snapshot-api (data plane)
 
 ```bash
 mvn spring-boot:run -f snapshot-api/pom.xml
 ```
 
-### 5. 运行 SDK Demo
+### 5. Run the SDK demo
 
 ```bash
-# 构建 fat jar
+# Build the fat jar
 mvn package -f feature-flag-sdk/pom.xml -DskipTests
 
-# 运行（默认连 localhost:8090）
+# Run (defaults to localhost:8090)
 java -DbaseUrl=http://localhost:8090 \
      -DapiKey=sk_live_xxx \
      -Denv=production \
      -jar feature-flag-sdk/target/feature-flag-sdk-0.1.0.jar
 ```
 
-Demo 输出示例：
+Sample demo output:
 ```
 === Feature Flag SDK Demo ===
 Snapshot API: http://localhost:8090
@@ -95,7 +95,7 @@ Demo finished.
 
 ---
 
-## 切换到 PostgreSQL
+## Switching to PostgreSQL
 
 ```bash
 docker run -d --name ff-pg -e POSTGRES_DB=featureflags -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:15
@@ -110,84 +110,84 @@ mvn spring-boot:run -f snapshot-api/pom.xml
 
 ---
 
-## API 速览
+## API quick reference
 
-### 数据面（snapshot-api :8090）
+### Data plane (snapshot-api :8090)
 
 ```
 GET /api/v1/snapshot
   Header: Authorization: Bearer <api_key>
   Header: X-Env: production
-  Header: If-None-Match: "v42.7"      ← 可选，304 缓存
+  Header: If-None-Match: "v42.7"      ← optional; 304 not modified
   → 200  { "version":"v42.7", "flags":[...], "etag":"v42.7" }
   → 304  (unchanged)
 ```
 
-### 控制面（management-api :8080）
+### Control plane (management-api :8080)
 
 ```
-POST   /api/v1/flags                       创建开关
-PUT    /api/v1/flags/{key}                 更新（If-Match 乐观锁）
-GET    /api/v1/flags                       搜索（?env=&prefix=&limit=）
-GET    /api/v1/flags/{key}                 详情 + 历史
-DELETE /api/v1/flags/{key}                 软删除（state → archived）
-POST   /api/v1/flags/{key}/rollout         灰度放量（只改 pct）
-POST   /api/v1/flags/{key}/targeting       定向规则（只改 rules）
-POST   /api/v1/admin/applications          注册应用（返回 api_key 仅一次）
-GET    /api/v1/explain?flag=&user=&at=      确定性重放
+POST   /api/v1/flags                       Create a flag
+PUT    /api/v1/flags/{key}                 Update (If-Match optimistic locking)
+GET    /api/v1/flags                       Search (?env=&prefix=&limit=)
+GET    /api/v1/flags/{key}                 Detail + history
+DELETE /api/v1/flags/{key}                 Soft delete (state → archived)
+POST   /api/v1/flags/{key}/rollout         Rollout (only changes pct)
+POST   /api/v1/flags/{key}/targeting       Targeting rules (only changes rules)
+POST   /api/v1/admin/applications          Register an app (returns api_key once)
+GET    /api/v1/explain?flag=&user=&at=     Deterministic replay
 ```
 
 ---
 
-## 运行测试
+## Running tests
 
-### 单元 / 集成测试
+### Unit / integration tests
 
 ```bash
 mvn test -f feature-flag-sdk/pom.xml    # 41 tests
 mvn test -f management-api/pom.xml      #  8 tests (SpringBootTest + H2)
-mvn test -f snapshot-api/pom.xml        #  9 tests (SpringBootTest + H2 + Mock Redis)
+mvn test -f snapshot-api/pom.xml        #  9 tests (SpringBootTest + H2 + mock Redis)
 ```
 
-### E2E 测试
+### E2E tests
 
-端到端测试在一个 JVM 里启动 management-api 和 snapshot-api（随机端口）、内嵌 Redis（自动找空闲端口）、共享 H2 内存数据库，SDK 走 loopback HTTP 调用 snapshot-api。
+The e2e tests start management-api and snapshot-api in a single JVM (random ports), an embedded Redis (auto-picks a free port), and a shared in-memory H2. The SDK hits snapshot-api over loopback HTTP.
 
-**不需要 Docker、不需要安装 Redis。** 内嵌 Redis 由 `com.github.codemonstur:embedded-redis` 自动管理。
+**No Docker required, no Redis install required.** The embedded Redis is managed automatically by `com.github.codemonstur:embedded-redis`.
 
 ```bash
-# 首次 / 代码有改动时 —— 构建所有依赖模块
+# First run, or after source changes — build all dependent modules
 mvn test -pl e2e-tests -am -Dtest='com.example.e2e.**' -Dsurefire.failIfNoSpecifiedTests=false
 
-# 后续 —— 仅运行 e2e 测试（依赖已装到本地 Maven 仓库）
+# Subsequent runs — e2e tests only (dependencies already in the local Maven repo)
 mvn test -pl e2e-tests -Dtest='com.example.e2e.**' -Dsurefire.failIfNoSpecifiedTests=false
 ```
 
-e2e 覆盖场景：
+E2E coverage:
 
-| 测试类 | 覆盖 |
-|--------|------|
-| `HappyPathTest` | boolean flag 创建→快照重建→SDK 拉取→isEnabled()；scope 隔离；targeting 规则；百分比灰度分布；本地评测性能 |
-| `FlagLifecycleTest` | 更新传播（定义变更后 SDK 看到新定义）；软删除（archive 后从快照消失）；版本号冲突（412）；乐观锁版本递增 |
-| `ExplainReplayTest` | /explain 确定性重放（更新后查询当前版本）；历史时间点 404；不存在的 flag 404 |
-| `AuthFlowTest` | 合法 API key；不合法 API key → 401；缺失 Auth header → 401；有快照时 → 200 |
-| `EtagCachingTest` | 首次请求 → 200 + ETag；相同 ETag → 304；快照更新后旧 ETag → 200 + 新版本号 |
+| Test class | What it covers |
+|------------|----------------|
+| `HappyPathTest` | Boolean flag create → snapshot rebuild → SDK fetch → isEnabled(); scope isolation; targeting rules; percentage rollout distribution; local evaluation performance |
+| `FlagLifecycleTest` | Update propagation (SDK sees the new definition after a change); soft delete (flag disappears from the snapshot after archive); version conflict (412); optimistic lock version increments |
+| `ExplainReplayTest` | /explain deterministic replay (query the current version after an update); historical time point → 404; non-existent flag → 404 |
+| `AuthFlowTest` | Valid API key; invalid API key → 401; missing Auth header → 401; with a snapshot present → 200 |
+| `EtagCachingTest` | First request → 200 + ETag; same ETag → 304; after a snapshot update, old ETag → 200 with a new version |
 
 ---
 
-## 环境变量
+## Environment variables
 
-| 变量 | 模块 | 默认值 | 说明 |
-|------|------|--------|------|
-| `DATASOURCE_URL` | management-api, snapshot-api | `jdbc:postgresql://localhost:5432/featureflags` | PG 连接 |
-| `DATASOURCE_USER` | management-api, snapshot-api | `postgres` | PG 用户 |
-| `DATASOURCE_PASSWORD` | management-api, snapshot-api | `postgres` | PG 密码 |
-| `REDIS_HOST` | 全部 | `localhost` | Redis 地址 |
-| `REDIS_PORT` | 全部 | `6379` | Redis 端口 |
-| `FF_SERVER_SECRET` | management-api, snapshot-api | `change-me-...` | HMAC 密钥 |
-| `FF_JWT_SECRET` | management-api | `change-me-...` | JWT 签名密钥 |
+| Variable | Module | Default | Description |
+|----------|--------|---------|-------------|
+| `DATASOURCE_URL` | management-api, snapshot-api | `jdbc:postgresql://localhost:5432/featureflags` | Postgres connection string |
+| `DATASOURCE_USER` | management-api, snapshot-api | `postgres` | Postgres user |
+| `DATASOURCE_PASSWORD` | management-api, snapshot-api | `postgres` | Postgres password |
+| `REDIS_HOST` | all | `localhost` | Redis host |
+| `REDIS_PORT` | all | `6379` | Redis port |
+| `FF_SERVER_SECRET` | management-api, snapshot-api | `change-me-...` | HMAC secret |
+| `FF_JWT_SECRET` | management-api | `change-me-...` | JWT signing secret |
 
-Auth filter 默认关闭，开启方式：
+Auth filters are disabled by default. Enable them with:
 ```yaml
 ff:
   auth:

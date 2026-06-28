@@ -47,6 +47,7 @@ Write path — only deployed in us-east primary
                           ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
                           │   us-east       │  │   eu-west       │  │   ap-southeast  │
                           │   (primary)     │  │   (~2s)         │  │   (~3s)         │
+                          │   ~0.5s         │  │                 │  │                 │
                           └─────────────────┘  └─────────────────┘  └─────────────────┘
                                     │                    │                    │
                               Kafka Consumer      Kafka Consumer      Kafka Consumer
@@ -609,7 +610,7 @@ SDK accumulates these in-process; Prometheus scrapes on a schedule. No network r
 2. **Management API** — control plane CRUD (create / update / delete / search)
 3. **Snapshot API** — GET + ETag, under 100 lines
 4. **Condition matcher** — rule matching + hash bucketing, under 200 lines
-5. **SDK prototype** — built-in polling timer + condition matcher
+5. **SDK demo** — built-in polling timer + condition matcher
 6. **Explain API** — historical version lookup + replay
 7. **Push channel** — Redis Pub/Sub change signal, SDK pulls snapshot when notified
 
